@@ -1,11 +1,7 @@
-from tkinter import *
+from tkinter import Tk, Label, Button
 from tkinter import messagebox as mb
 from tkinter import ttk
 import requests
-import json
-import pprint
-
-from bottle import response
 
 
 def update_currency_label(event):
@@ -19,6 +15,12 @@ def update_base_label(event):
     code = base_combobox.get()
     name = currencies[code]
     base_label.config(text=name)
+
+
+def update_second_base_label(event):
+    code = second_base_combobox.get()
+    name = currencies[code]
+    second_base_label.config(text=name)
 
 
 def exchange():
@@ -64,35 +66,52 @@ currencies = {
 
 }
 
-root = Tk()
-root.title('Курс обмена валют USD')
-root.geometry('360x180')
+def main():
+    global root, base_combobox, second_base_combobox, target_combobox
+    global base_label, second_base_label, target_label
 
-Label(root, text='Базовая валюта').pack()
-base_combobox = ttk.Combobox(root, values=list(currencies.keys()))
-base_combobox.pack(pady=3, padx=10)
-base_combobox.bind('<<ComboboxSelected>>', update_base_label)
-base_label = ttk.Label()
-base_label.pack()
+    root = Tk()
+    root.title('Курсы обмена валют')
+    root.geometry('360x450')
+    root.minsize(360, 450)
 
-Label(root, text='Целевая валюта' ).pack(padx=10)
-# popular_currencies = ['EUR', 'JPY', 'GBP', 'AUD', 'CAD', 'CHF',
-#                       'CNY', 'RUB', 'KZT', 'UZS']
-target_combobox = ttk.Combobox(root, values=list(currencies.keys()))
-target_combobox.pack(pady=3, padx=10)
-target_combobox.bind('<<ComboboxSelected>>', update_currency_label)
+    Label(root, text='Базовая валюта').pack(pady=(15, 10))
+    base_combobox = ttk.Combobox(
+        root, values=list(currencies), state='readonly'
+    )
+    base_combobox.set('EUR')
+    base_combobox.pack(pady=10)
+    base_combobox.bind('<<ComboboxSelected>>', update_base_label)
+    base_label = ttk.Label(root, text=currencies['EUR'])
+    base_label.pack(pady=10)
 
-target_label = ttk.Label()
-target_label.pack()
-# entry = Entry(root)
-# entry.pack()
+    Label(root, text='Вторая базовая валюта').pack(pady=10)
+    second_base_combobox = ttk.Combobox(
+        root, values=list(currencies), state='readonly'
+    )
+    second_base_combobox.set('USD')
+    second_base_combobox.pack(pady=10)
+    second_base_combobox.bind(
+        '<<ComboboxSelected>>', update_second_base_label
+    )
+    second_base_label = ttk.Label(root, text=currencies['USD'])
+    second_base_label.pack(pady=10)
 
-Button(text='Получить курс обмена к доллару',
-       command=exchange).pack(pady=10, padx=10)
+    Label(root, text='Целевая валюта').pack(pady=10)
+    target_combobox = ttk.Combobox(
+        root, values=list(currencies), state='readonly'
+    )
+    target_combobox.set('RUB')
+    target_combobox.pack(pady=10)
+    target_combobox.bind('<<ComboboxSelected>>', update_currency_label)
+    target_label = ttk.Label(root, text=currencies['RUB'])
+    target_label.pack(pady=10)
+
+    Button(root, text='Получить курсы обмена', command=exchange).pack(
+        pady=15, padx=10
+    )
+    root.mainloop()
 
 
-root.mainloop()
-# p = pprint.PrettyPrinter(indent=4)
-# result = requests.get('https://open.er-api.com/v6/latest/USD')
-# data = json.loads(result.text)
-# p.pprint(data)
+if __name__ == '__main__':
+    main()
