@@ -1,12 +1,13 @@
 from tkinter import Tk, Label, Button
 from tkinter import messagebox as mb
 from tkinter import ttk
+from math import isfinite
+import webbrowser
 import requests
 
 
 def update_currency_label(event):
     code = target_combobox.get()
-    # code = combobox.get()
     name = currencies[code]
     target_label.config(text=name)
 
@@ -26,29 +27,60 @@ def update_second_base_label(event):
 def exchange():
     target_code = target_combobox.get().strip()
     base_code = base_combobox.get().strip()
-    # code = entry.get().upper().strip()
-    # code = combobox.get()
-    if target_code and base_code:
-        try:
+    second_base_code = second_base_combobox.get().strip()
 
-            response = requests.get(f'https://open.er-api.com/v6/latest/{base_code}')
+    if any(code not in currencies for code in (
+        base_code, second_base_code, target_code
+    )):
+        mb.showwarning('Внимание', 'Выберите обе базовые и целевую валюты.')
+        return
+
+    results = []
+    success_count = 0
+
+    # Для каждой базовой валюты получаем отдельный ответ в формате JSON.
+    for code in (base_code, second_base_code):
+        try:
+            response = requests.get(
+                f'https://open.er-api.com/v6/latest/{code}', timeout=10
+            )
             response.raise_for_status()
             data = response.json()
-            if target_code in data['rates']:
-                exchange_rate = data['rates'][target_code]
-                base = currencies[base_code]
-                target = currencies[target_code]
-                # currency_name = currencies[code]
-                mb.showinfo('Курс обмена',
-                            f'Курс: {exchange_rate:.1f} {target} за 1 {base}')
-            else:
-                mb.showerror('Ошибка',
-                            f'Валюта {target_code} не найдена')
-        except Exception as er:
-            mb.showerror('Ошибка', er)
 
+            if data['result'] != 'success':
+                error_type = data.get('error-type', 'неизвестная ошибка')
+                raise ValueError(f'Ошибка сервиса: {error_type}')
+
+            if target_code not in data['rates']:
+                raise ValueError(f'Валюта {target_code} не найдена в ответе.')
+
+            exchange_rate = float(data['rates'][target_code])
+            if not isfinite(exchange_rate) or exchange_rate <= 0:
+                raise ValueError('Сервис вернул некорректный курс.')
+
+            # Шесть значащих цифр сохраняют точность и для небольших курсов.
+            results.append(f'1 {code} = {exchange_rate:.6g} {target_code}')
+            success_count += 1
+        except requests.exceptions.JSONDecodeError:
+            results.append(f'{code}: сервер вернул некорректный JSON.')
+        except requests.RequestException:
+            results.append(
+                f'{code}: не удалось получить курс. '
+                'Проверьте интернет и повторите попытку.'
+            )
+        except (KeyError, TypeError):
+            results.append(f'{code}: неверный формат данных сервиса.')
+        except ValueError as error:
+            results.append(f'{code}: {error}')
+
+    # Обе строки показываем одновременно, даже если один запрос не удался.
+    message = '\n'.join(results)
+    if success_count == 2:
+        mb.showinfo('Курсы обмена', message)
+    elif success_count == 1:
+        mb.showwarning('Получен только один курс', message)
     else:
-        mb.showwarning('Внимание', 'Введите код валюты')
+        mb.showerror('Ошибка получения курсов', message)
 
 
 currencies = {
@@ -72,8 +104,8 @@ def main():
 
     root = Tk()
     root.title('Курсы обмена валют')
-    root.geometry('360x450')
-    root.minsize(360, 450)
+    root.geometry('360x490')
+    root.minsize(360, 490)
 
     Label(root, text='Базовая валюта').pack(pady=(15, 10))
     base_combobox = ttk.Combobox(
@@ -109,6 +141,14 @@ def main():
 
     Button(root, text='Получить курсы обмена', command=exchange).pack(
         pady=15, padx=10
+    )
+    source_label = ttk.Label(
+        root, text='Курсы: ExchangeRate-API', foreground='blue', cursor='hand2'
+    )
+    source_label.pack(pady=(0, 10))
+    source_label.bind(
+        '<Button-1>',
+        lambda event: webbrowser.open('https://www.exchangerate-api.com')
     )
     root.mainloop()
 
