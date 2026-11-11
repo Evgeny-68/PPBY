@@ -1,0 +1,17 @@
+[project]
+name = "pythonproject-ppbu"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "bottle>=0.13.4",
+    "g4f>=8.9.2",
+    "matplotlib>=3.11.2",
+    "opencage>=3.4.0",
+    "pillow>=13.0.0",
+    "pyperclip>=1.11.0",
+    "python-docx>=1.2.0",
+    "requests>=2.34.2",
+    "thread>=2.0.6",
+    "translate>=3.8.1",
+]
