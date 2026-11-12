@@ -38,6 +38,9 @@
 
 ## Материалы итогового проекта
 
+- [Итоговая аттестационная работа](docs/final_attestation.docx).
+- [Инструкция запуска итогового комплекта](docs/final_readme.txt).
+- [Памятка для защиты](docs/final_defense.txt).
 - [Техническое задание для чтения на GitHub](docs/final_spec.md).
 - [Техническое задание в Word с эскизом](docs/final_spec.docx).
 - [Эскиз интерфейса](assets/final_ui_sketch.png).
