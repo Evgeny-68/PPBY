@@ -444,6 +444,9 @@ MOSCOW_TIME = timezone(timedelta(hours=3))
 COIN_LABELS = {coin.symbol: f'{coin.symbol} — {coin.name}' for coin in COINS}
 CURRENCY_LABELS = {code: f'{code} — {name}' for code, name in FIAT_NAMES.items()}
 CURRENCY_LABELS['USDT'] = 'USDT — Tether'
+CHANGE_UP_COLOR = '#187846'
+CHANGE_DOWN_COLOR = '#B43D45'
+CHANGE_NEUTRAL_COLOR = '#425971'
 
 
 def format_price(value: Decimal):
@@ -603,6 +606,8 @@ class CryptoApp:
         self.price_text = tk.StringVar()
         self.low_text = tk.StringVar(value='—')
         self.high_text = tk.StringVar(value='—')
+        self.change_text = tk.StringVar(value='24 ч: —')
+        self.turnover_text = tk.StringVar(value='Оборот 24 ч: —')
         self.selection_hint = tk.StringVar()
         self.card_state = tk.StringVar(value='Ожидание данных')
         self.market_title = tk.StringVar()
@@ -642,6 +647,11 @@ class CryptoApp:
         style.configure('Pair.TLabel', background='white', foreground='#416076', font=('Segoe UI', 11, 'bold'))
         style.configure('Price.TLabel', background='white', foreground='#132C46', font=('Segoe UI', 27, 'bold'))
         style.configure('Metric.TLabel', background='white', foreground='#172F49', font=('Segoe UI', 15, 'bold'))
+        for name, color in (('Up', CHANGE_UP_COLOR), ('Down', CHANGE_DOWN_COLOR),
+                            ('Neutral', CHANGE_NEUTRAL_COLOR)):
+            style.configure(f'Change{name}.TLabel', background='white', foreground=color,
+                            font=('Segoe UI', 11, 'bold'))
+        style.configure('Turnover.TLabel', background='white', foreground='#425971', font=('Segoe UI', 10))
         style.configure('CardState.TLabel', background='white', foreground='#087F8C', font=('Segoe UI', 9, 'bold'))
         style.configure('CardWarning.TLabel', background='white', foreground='#9A5A16', font=('Segoe UI', 9, 'bold'))
         style.configure('Status.TLabel', foreground='#36566F', font=('Segoe UI', 9))
@@ -650,7 +660,8 @@ class CryptoApp:
                         foreground='#233E55', font=('Segoe UI', 10), borderwidth=0)
         style.configure('Treeview.Heading', background='#E7EEF5', foreground='#34516B',
                         font=('Segoe UI', 9, 'bold'), padding=(8, 7))
-        style.map('Treeview', background=[('selected', '#D9ECEF')], foreground=[('selected', '#123E49')])
+        # Светлое выделение сохраняет красный/зелёный цвет направления строки.
+        style.map('Treeview', background=[('selected', '#D9ECEF')], foreground=[])
 
         frame = ttk.Frame(self.root, style='App.TFrame', padding=(24, 16))
         frame.pack(fill='both', expand=True)
@@ -735,8 +746,13 @@ class CryptoApp:
             metric.grid(row=1, column=column, sticky='e')
             ttk.Label(metric, text=title, style='CardNote.TLabel').pack(anchor='e')
             ttk.Label(metric, textvariable=variable, style='Metric.TLabel').pack(anchor='e', pady=(4, 0))
+        trading_metrics = ttk.Frame(card, style='Card.TFrame')
+        trading_metrics.grid(row=2, column=0, columnspan=3, sticky='w', pady=(3, 3))
+        self.change_label = ttk.Label(trading_metrics, textvariable=self.change_text, style='ChangeNeutral.TLabel')
+        self.change_label.pack(side='left')
+        ttk.Label(trading_metrics, textvariable=self.turnover_text, style='Turnover.TLabel').pack(side='left', padx=(24, 0))
         self.hint_label = ttk.Label(card, textvariable=self.selection_hint, style='CardNote.TLabel', wraplength=820)
-        self.hint_label.grid(row=2, column=0, columnspan=3, sticky='w', pady=(4, 0))
+        self.hint_label.grid(row=3, column=0, columnspan=3, sticky='w', pady=(4, 0))
         self._price_fonts = {size: tkfont.Font(root=self.root, family='Segoe UI', size=size, weight='bold')
                              for size in range(14, 28)}
         self._metric_font = tkfont.Font(root=self.root, family='Segoe UI', size=15, weight='bold')
@@ -751,20 +767,23 @@ class CryptoApp:
         table_frame.grid(row=4, column=0, columnspan=2, sticky='nsew')
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
-        columns = ('name', 'symbol', 'price', 'low', 'high', 'availability')
+        columns = ('name', 'symbol', 'price', 'change', 'turnover', 'availability')
         self.table = ttk.Treeview(table_frame, columns=columns, show='headings', height=8,
                                   selectmode='browse', takefocus=True)
         for column, title, width, minimum, anchor in (
             ('name', 'Криптовалюта', 174, 160, 'w'),
             ('symbol', 'Тикер', 70, 60, 'center'),
             ('price', 'Цена, USD', 140, 108, 'e'),
-            ('low', 'Мин. 24 ч, USD', 140, 115, 'e'),
-            ('high', 'Макс. 24 ч, USD', 140, 115, 'e'),
+            ('change', '24 ч, %', 140, 120, 'e'),
+            ('turnover', 'Оборот 24 ч, USD', 140, 125, 'e'),
             ('availability', 'Доступность', 166, 150, 'w'),
         ):
             self.table.heading(column, text=title, anchor=anchor)
             self.table.column(column, width=width, minwidth=minimum, anchor=anchor)
         self.table.tag_configure('stripe', background='#F4F8FB')
+        self.table.tag_configure('trend_up', foreground=CHANGE_UP_COLOR)
+        self.table.tag_configure('trend_down', foreground=CHANGE_DOWN_COLOR)
+        self.table.tag_configure('trend_neutral', foreground='#233E55')
         self.table.grid(row=0, column=0, sticky='nsew')
         self.scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview)
         self.scrollbar.grid(row=0, column=1, sticky='ns')
@@ -818,12 +837,22 @@ class CryptoApp:
         self.pair_title.set(f'{coin.name}  ·  {symbol} / {currency}')
         self.low_text.set('—')
         self.high_text.set('—')
+        self.change_text.set('24 ч: —')
+        self.turnover_text.set('Оборот 24 ч: —')
+        self.change_label.configure(style='ChangeNeutral.TLabel')
         if symbol == currency:
             self.price_text.set('Валюта совпадает')
             self.selection_hint.set(f'Выбран {symbol} к самому себе. Рыночная цена пары {symbol}/{currency} не выводится.')
         elif quote is not None and quote.status == 'available':
             sign = '≈' if quote.provenance == 'calculated' else '='
+            approximate = '≈ ' if quote.provenance == 'calculated' else ''
             self.price_text.set(f'1 {symbol} {sign} {format_price(quote.price)} {currency}')
+            if quote.change_24h is not None:
+                self.change_text.set(f'24 ч: {approximate}{format_change(quote.change_24h)}')
+                direction = 'Up' if quote.change_24h > 0 else 'Down' if quote.change_24h < 0 else 'Neutral'
+                self.change_label.configure(style=f'Change{direction}.TLabel')
+            if quote.turnover_24h is not None:
+                self.turnover_text.set(f'Оборот 24 ч: {approximate}{format_turnover(quote.turnover_24h)} {currency}')
             if quote.low_24h is not None and quote.high_24h is not None:
                 self.low_text.set(f'{format_price(quote.low_24h)} {currency}')
                 self.high_text.set(f'{format_price(quote.high_24h)} {currency}')
@@ -832,9 +861,12 @@ class CryptoApp:
                 if quote.fx_date is not None:
                     details += f'FX от {quote.fx_date:%d.%m.%Y}; изменения валютного курса за период не учитываются. '
                 details += 'Минимум и максимум доступны только для прямой пары.'
+                if quote.turnover_24h is not None:
+                    market = f'{symbol}/{quote.turnover_market[len(symbol):]}'
+                    details += f' Оборот {market} пересчитан по текущему курсу; это приблизительная оценка, не оборот рынка {symbol}/{currency}.'
                 self.selection_hint.set(details)
             else:
-                self.selection_hint.set(f'Прямая пара {symbol}/{currency} на {self.snapshot.source}: последняя сделка и диапазон за 24 часа.')
+                self.selection_hint.set(f'Прямая пара {symbol}/{currency} на {self.snapshot.source}: последняя сделка, изменение и оборот этого рынка за 24 часа.')
         elif self.snapshot is None:
             self.price_text.set(f'1 {symbol} = — {currency}')
             self.selection_hint.set('Котировка появится после получения данных от биржи.')
@@ -878,30 +910,37 @@ class CryptoApp:
             if children:
                 self.table.delete(*children)
             self.displayed_currency = currency
-        for column, label in (('price', 'Цена'), ('low', 'Мин. 24 ч'), ('high', 'Макс. 24 ч')):
+        for column, label in (('price', 'Цена'), ('turnover', 'Оборот 24 ч')):
             self.table.heading(column, text=f'{label}, {currency}')
+        self.table.heading('change', text='24 ч, %')
         for index, coin in enumerate(COINS):
             quote = self._quote_for(coin.symbol, currency)
-            price = low = high = '—'
+            price = change = turnover = '—'
+            trend = 'trend_neutral'
             if coin.symbol == currency:
                 availability = 'Валюта совпадает'
             elif quote is not None and quote.status == 'available':
                 price = format_price(quote.price)
+                approximate = '≈ ' if quote.provenance == 'calculated' else ''
+                if quote.change_24h is not None:
+                    change = approximate + format_change(quote.change_24h)
+                    trend = 'trend_up' if quote.change_24h > 0 else 'trend_down' if quote.change_24h < 0 else 'trend_neutral'
+                if quote.turnover_24h is not None:
+                    turnover = approximate + format_turnover(quote.turnover_24h)
                 if quote.provenance == 'calculated':
                     price = '≈ ' + price
                     availability = 'Расчёт · FX устарел' if quote.fx_stale else 'Расчёт'
                 else:
-                    low, high = format_price(quote.low_24h), format_price(quote.high_24h)
                     availability = 'Прямая пара'
             else:
                 availability = 'Ожидание' if self.snapshot is None else 'Нет данных'
-            values = (coin.name, coin.symbol, price, low, high, availability)
+            values = (coin.name, coin.symbol, price, change, turnover, availability)
+            tags = ('stripe', trend) if index % 2 == 0 else (trend,)
             row_id = f'{coin.symbol}:{currency}'
             if row_id in self.table.get_children():
-                self.table.item(row_id, values=values)
+                self.table.item(row_id, values=values, tags=tags)
             else:
-                self.table.insert('', 'end', iid=row_id, values=values,
-                                  tags=('stripe',) if index % 2 == 0 else ())
+                self.table.insert('', 'end', iid=row_id, values=values, tags=tags)
         self.market_title.set(f'Все криптовалюты · {currency}')
         self._select_table_row()
 

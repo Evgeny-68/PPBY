@@ -907,6 +907,7 @@ class FakeTable:
     """Хранит видимые строки и выбор так же, как нужная тестам часть Treeview."""
     def __init__(self):
         self.rows = {}
+        self.tags = {}
         self.selected = ()
         self.headings = {}
         self.updates = []
@@ -919,20 +920,26 @@ class FakeTable:
 
     def insert(self, parent, index, iid, values=(), **kwargs):
         self.rows[iid] = tuple(values)
+        self.tags[iid] = tuple(kwargs.get('tags', ()))
         return iid
 
     def delete(self, *items):
         for iid in items:
             self.rows.pop(iid, None)
+            self.tags.pop(iid, None)
         self.selected = tuple(iid for iid in self.selected if iid in self.rows)
 
     def item(self, iid, option=None, **kwargs):
         if 'values' in kwargs:
             self.rows[iid] = tuple(kwargs['values'])
             self.updates.append((iid, self.rows[iid]))
+        if 'tags' in kwargs:
+            self.tags[iid] = tuple(kwargs['tags'])
         if option == 'values':
             return self.rows[iid]
-        return {'values': self.rows[iid]}
+        if option == 'tags':
+            return self.tags[iid]
+        return {'values': self.rows[iid], 'tags': self.tags[iid]}
 
     def selection(self):
         return self.selected
@@ -967,6 +974,8 @@ class WorkerAndWindowTests(unittest.TestCase):
         window.currency_selection = FakeVar('USD — доллар США')
         window.pair_title, window.price_text = FakeVar(), FakeVar()
         window.low_text, window.high_text = FakeVar(), FakeVar()
+        window.change_text, window.turnover_text = FakeVar(), FakeVar()
+        window.change_label = Mock()
         window.selection_hint, window.card_state = FakeVar(), FakeVar()
         window.market_title = FakeVar()
         window.displayed_currency = None
@@ -993,6 +1002,10 @@ class WorkerAndWindowTests(unittest.TestCase):
             parse_quotes(ticker_payload() if payload is None else payload),
             received_at or datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
+
+    def metrics_snapshot(self, payload=None, fx=None):
+        return Snapshot(parse_quotes(metrics_payload() if payload is None else payload, fx),
+                        TEST_TIME, fx=fx)
 
     def assert_no_network_on_selection(self, window):
         window.refresh.assert_not_called()
@@ -1275,6 +1288,133 @@ class WorkerAndWindowTests(unittest.TestCase):
         self.assertIn('EUR', window.chart_caption.get())
         self.assertIn('FX', window.chart_caption.get())
         self.assertNotIn('RUB', window.chart_title.get())
+
+    def test_direct_metrics_show_pair_units_and_separate_per_asset_turnover(self):
+        window = self.window()
+        window._show_result(self.metrics_snapshot(), None)
+        self.assertEqual(window.change_text.get(), '24 ч: ▼ -1.25%')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: 1.00 тыс. USD')
+        self.assertIn('BTC/USD', window.selection_hint.get())
+        window.change_label.configure.assert_called_with(style='ChangeDown.TLabel')
+        self.assertEqual(window.table.rows['BTC:USD'][3:5], ('▼ -1.25%', '1.00 тыс.'))
+        self.assertEqual(window.table.rows['ETH:USD'][3:5], ('▲ +2.00%', '2.00 тыс.'))
+        self.assertIn('trend_down', window.table.tags['BTC:USD'])
+        self.assertIn('trend_up', window.table.tags['ETH:USD'])
+        self.assertEqual(window.table.headings['turnover']['text'], 'Оборот 24 ч, USD')
+        self.assertEqual(window.table.headings['price']['text'], 'Цена, USD')
+
+    def test_metric_selection_moves_between_up_zero_and_identity_without_old_values(self):
+        window = self.window()
+        window._show_result(self.metrics_snapshot(), None)
+        window.coin_selection.set(gui.COIN_LABELS['ETH'])
+        window._on_coin_selected()
+        self.assertEqual(window.change_text.get(), '24 ч: ▲ +2.00%')
+        window.change_label.configure.assert_called_with(style='ChangeUp.TLabel')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: 2.00 тыс. USD')
+        window.currency_selection.set(gui.CURRENCY_LABELS['USDT'])
+        window.coin_selection.set(gui.COIN_LABELS['SOL'])
+        window._on_currency_selected()
+        self.assertEqual(window.change_text.get(), '24 ч: 0.00%')
+        window.change_label.configure.assert_called_with(style='ChangeNeutral.TLabel')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: 3.00 тыс. USDT')
+        self.assertIn('trend_neutral', window.table.tags['SOL:USDT'])
+        self.assertEqual(window.table.headings['turnover']['text'], 'Оборот 24 ч, USDT')
+        window.coin_selection.set(gui.COIN_LABELS['USDT'])
+        window._on_coin_selected()
+        self.assertEqual(window.change_text.get(), '24 ч: —')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: —')
+        window.change_label.configure.assert_called_with(style='ChangeNeutral.TLabel')
+        self.assertEqual(window.table.rows['USDT:USDT'][3:5], ('—', '—'))
+        self.assert_no_network_on_selection(window)
+
+    def test_calculated_metrics_use_selected_currency_approximation_and_actual_source_pair(self):
+        window = self.window()
+        window.currency_selection.set(gui.CURRENCY_LABELS['RUB'])
+        window._show_result(self.metrics_snapshot(fx=example_fx()), None)
+        self.assertEqual(window.change_text.get(), '24 ч: ≈ ▼ -1.25%')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: ≈ 100.00 тыс. RUB')
+        self.assertEqual(window.table.rows['BTC:RUB'][3:5], ('≈ ▼ -1.25%', '≈ 100.00 тыс.'))
+        self.assertIn('BTC/USD', window.selection_hint.get())
+        self.assertEqual(window.table.headings['turnover']['text'], 'Оборот 24 ч, RUB')
+        window.coin_selection.set(gui.COIN_LABELS['BNB'])
+        window._on_coin_selected()
+        self.assertEqual(window.change_text.get(), '24 ч: ≈ ▲ +10.33%')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: ≈ 200.06 тыс. RUB')
+        self.assertIn('Оборот BNB/USDT', window.selection_hint.get())
+        self.assertIn('текущему курсу', window.selection_hint.get())
+        self.assertIn('приблиз', window.selection_hint.get().lower())
+
+    def test_direct_eur_metrics_have_own_values_without_approximation(self):
+        window = self.window()
+        payload = metrics_payload()
+        payload['result']['list'].append({
+            'symbol': 'BTCEUR', 'lastPrice': '55000', 'lowPrice24h': '54000',
+            'highPrice24h': '56000', 'price24hPcnt': '-0.02', 'turnover24h': '700',
+        })
+        window.currency_selection.set(gui.CURRENCY_LABELS['EUR'])
+        window._show_result(self.metrics_snapshot(payload, example_fx()), None)
+        self.assertEqual(window.change_text.get(), '24 ч: ▼ -2.00%')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: 700.00 EUR')
+        self.assertEqual(window.table.rows['BTC:EUR'][3:5], ('▼ -2.00%', '700.00'))
+        self.assertIn('BTC/EUR', window.selection_hint.get())
+        self.assertNotIn('≈', window.change_text.get() + window.turnover_text.get())
+
+    def test_success_without_optional_metrics_clears_previous_numbers_and_direction(self):
+        window = self.window()
+        window._show_result(self.metrics_snapshot(), None)
+        payload = metrics_payload()
+        market(payload, 'BTCUSD').update(price24hPcnt='bad', turnover24h=None)
+        window._show_result(self.metrics_snapshot(payload), None)
+        self.assertEqual(window.change_text.get(), '24 ч: —')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: —')
+        self.assertEqual(window.table.rows['BTC:USD'][3:5], ('—', '—'))
+        self.assertIn('trend_neutral', window.table.tags['BTC:USD'])
+        self.assertNotIn('trend_down', window.table.tags['BTC:USD'])
+        window.change_label.configure.assert_called_with(style='ChangeNeutral.TLabel')
+        self.assertIn('60 000.10', window.price_text.get())
+        self.assertFalse(window.stale)
+
+    def test_metric_failure_preserves_last_snapshot_and_switches_to_selected_stale_values(self):
+        window = self.window()
+        window._show_result(self.metrics_snapshot(), None)
+        original = (window.change_text.get(), window.turnover_text.get())
+        window._show_result(None, 'Нет сети')
+        self.assertEqual((window.change_text.get(), window.turnover_text.get()), original)
+        self.assertIn('устар', window.card_state.get().lower())
+        window.coin_selection.set(gui.COIN_LABELS['ETH'])
+        window._on_coin_selected()
+        self.assertEqual(window.change_text.get(), '24 ч: ▲ +2.00%')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: 2.00 тыс. USD')
+        self.assertIn('устар', window.card_state.get().lower())
+        self.assertTrue(window.stale)
+
+    def test_initial_failure_and_missing_pair_keep_metrics_empty(self):
+        window = self.window()
+        window._show_result(None, 'Нет сети')
+        self.assertEqual(window.change_text.get(), '24 ч: —')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: —')
+        window._show_result(self.metrics_snapshot(), None)
+        window.currency_selection.set(gui.CURRENCY_LABELS['RUB'])
+        window._on_currency_selected()
+        self.assertEqual(window.change_text.get(), '24 ч: —')
+        self.assertEqual(window.turnover_text.get(), 'Оборот 24 ч: —')
+        self.assertEqual(window.table.rows['BTC:RUB'][3:5], ('—', '—'))
+        window.change_label.configure.assert_called_with(style='ChangeNeutral.TLabel')
+
+    def test_refresh_updates_existing_row_trend_tags_and_keeps_zero_turnover_visible(self):
+        window = self.window()
+        window._show_result(self.metrics_snapshot(), None)
+        payload = metrics_payload()
+        market(payload, 'BTCUSD').update(price24hPcnt='0.04', turnover24h='0')
+        market(payload, 'ETHUSD')['price24hPcnt'] = '0'
+        window._show_result(self.metrics_snapshot(payload), None)
+        self.assertEqual(window.table.rows['BTC:USD'][3], '▲ +4.00%')
+        self.assertEqual(Decimal(window.table.rows['BTC:USD'][4]), Decimal('0'))
+        self.assertIn('trend_up', window.table.tags['BTC:USD'])
+        self.assertNotIn('trend_down', window.table.tags['BTC:USD'])
+        self.assertEqual(window.table.rows['ETH:USD'][3], '0.00%')
+        self.assertIn('trend_neutral', window.table.tags['ETH:USD'])
+        self.assertNotIn('trend_up', window.table.tags['ETH:USD'])
 
     def test_initial_fx_failure_message_does_not_claim_a_cached_date(self):
         window = self.window()
