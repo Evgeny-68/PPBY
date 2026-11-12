@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -11,13 +12,17 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from crypto_api_task6 import BybitClient, QuoteError, Snapshot, parse_quotes
-
 spec = importlib.util.spec_from_file_location(
     'crypto_window_task6', Path(__file__).with_name('Задание 6.py')
 )
 gui = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = gui
 spec.loader.exec_module(gui)
+
+BybitClient = gui.BybitClient
+QuoteError = gui.QuoteError
+Snapshot = gui.Snapshot
+parse_quotes = gui.parse_quotes
 
 
 def ticker_payload():
@@ -203,7 +208,7 @@ class ParseQuotesTests(unittest.TestCase):
 
 class BybitClientTests(unittest.TestCase):
     def setUp(self):
-        patcher = patch('crypto_api_task6.requests.get')
+        patcher = patch.object(gui.requests, 'get')
         self.get = patcher.start()
         self.addCleanup(patcher.stop)
         self.response = Mock()

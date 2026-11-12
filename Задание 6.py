@@ -1,19 +1,172 @@
 """Задание 6. Прямые котировки Bybit отдельно к USD и USDT.
 
 Запуск: python "Задание 6.py"
-Зависимости: python -m pip install -r requirements_task6.txt
+Зависимость: python -m pip install requests
+Для запуска достаточно этого файла; иконка встроена в код.
 """
 
-from datetime import timedelta, timezone
-from decimal import Decimal
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from queue import Empty, Queue
+from tempfile import TemporaryDirectory
 from threading import Thread
+import base64
 import time
 import tkinter as tk
 from tkinter import ttk
 
-from crypto_api_task6 import COINS, QUOTE_CURRENCIES, BybitClient, QuoteError
+import requests
+
+
+@dataclass(frozen=True)
+class Coin:
+    symbol: str
+    name: str
+
+
+COINS = (
+    Coin('BTC', 'Bitcoin'),
+    Coin('ETH', 'Ethereum'),
+    Coin('USDT', 'Tether'),
+    Coin('GRAM', 'Gram (Toncoin)'),
+    Coin('BNB', 'BNB'),
+    Coin('SOL', 'Solana'),
+    Coin('XRP', 'XRP'),
+    Coin('DOGE', 'Dogecoin'),
+)
+QUOTE_CURRENCIES = ('USD', 'USDT')
+
+
+@dataclass(frozen=True)
+class Quote:
+    symbol: str
+    name: str
+    currency: str
+    price: Decimal | None = None
+    low_24h: Decimal | None = None
+    high_24h: Decimal | None = None
+    status: str = 'available'
+
+    @property
+    def row_id(self):
+        return f'{self.symbol}:{self.currency}'
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    quotes: tuple[Quote, ...]
+    received_at: datetime
+    source: str = 'Bybit'
+
+
+class QuoteError(Exception):
+    """Понятная пользователю ошибка получения котировок."""
+
+
+def positive_decimal(value):
+    """Не пропускаем пустые, бесконечные, нулевые и отрицательные цены."""
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise QuoteError('Сервис вернул некорректную цену.') from None
+    if not number.is_finite() or number <= 0:
+        raise QuoteError('Сервис вернул некорректную цену.')
+    return number
+
+
+def parse_quotes(data):
+    """Нормализуем только точные пары; отсутствующие пары не пересчитываем."""
+    if not isinstance(data, dict) or type(data.get('retCode')) is not int:
+        raise QuoteError('Сервис вернул неверный формат данных.')
+    if data['retCode'] != 0:
+        if data['retCode'] in (10006, 10018):
+            raise QuoteError('Слишком много запросов. Повторите попытку позднее.')
+        raise QuoteError('Bybit сообщил об ошибке. Повторите попытку позднее.')
+    result = data.get('result')
+    if not isinstance(result, dict) or result.get('category') != 'spot':
+        raise QuoteError('Сервис вернул неверный формат спотовых котировок.')
+    items = result.get('list')
+    if not isinstance(items, list) or not items:
+        raise QuoteError('Сервис вернул пустой или неверный список котировок.')
+
+    allowed_pairs = {
+        coin.symbol + currency
+        for currency in QUOTE_CURRENCIES
+        for coin in COINS
+        if coin.symbol != currency
+    }
+    prices = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise QuoteError('Сервис вернул неверную запись котировки.')
+        symbol = item.get('symbol')
+        if not isinstance(symbol, str) or not symbol:
+            raise QuoteError('Сервис не указал символ торговой пары.')
+        # Например, BTCUSDT и BTCUSD — разные рынки. Совпадения по суффиксу нет.
+        if symbol not in allowed_pairs:
+            continue
+        if symbol in prices:
+            raise QuoteError(f'Сервис вернул повторяющиеся данные пары {symbol}.')
+        try:
+            price = positive_decimal(item['lastPrice'])
+            low = positive_decimal(item['lowPrice24h'])
+            high = positive_decimal(item['highPrice24h'])
+        except KeyError:
+            raise QuoteError(f'Некорректные данные пары {symbol}.') from None
+        if low > high:
+            raise QuoteError(f'Некорректный диапазон цен пары {symbol}.')
+        prices[symbol] = (price, low, high)
+
+    if not prices:
+        raise QuoteError('В ответе сервиса нет данных выбранных торговых пар.')
+
+    quotes = []
+    for currency in QUOTE_CURRENCIES:
+        for coin in COINS:
+            pair = coin.symbol + currency
+            if coin.symbol == currency:
+                # USDT/USDT не является рыночным курсом и не показывается как 1.
+                quote = Quote(coin.symbol, coin.name, currency, status='quote_currency')
+            elif pair not in prices:
+                quote = Quote(coin.symbol, coin.name, currency, status='missing')
+            else:
+                quote = Quote(coin.symbol, coin.name, currency, *prices[pair])
+            quotes.append(quote)
+    return tuple(quotes)
+
+
+class BybitClient:
+    """Адаптер источника: другой API может реализовать тот же fetch_quotes()."""
+
+    url = 'https://api.bybit.com/v5/market/tickers'
+
+    def fetch_quotes(self):
+        try:
+            response = requests.get(
+                self.url,
+                params={'category': 'spot'},
+                headers={'Accept': 'application/json'},
+                timeout=(5, 10),
+            )
+            response.raise_for_status()
+        except requests.Timeout:
+            raise QuoteError('Сервис не ответил вовремя. Повторите попытку.') from None
+        except requests.HTTPError as error:
+            if error.response is not None and error.response.status_code == 429:
+                raise QuoteError('Слишком много запросов. Повторите попытку позднее.') from None
+            raise QuoteError('Сервис временно недоступен. Повторите попытку позднее.') from None
+        except requests.RequestException:
+            raise QuoteError('Не удалось подключиться. Проверьте интернет.') from None
+
+        try:
+            data = response.json()
+        except ValueError:
+            raise QuoteError('Сервис вернул некорректный JSON.') from None
+        quotes = parse_quotes(data)
+        # Это время получения ответа, а не время последней сделки на бирже.
+        return Snapshot(quotes, datetime.now(timezone.utc))
 
 
 AUTO_REFRESH_SECONDS = 60
@@ -73,13 +226,7 @@ class CryptoApp:
         self.card_state = tk.StringVar(value='Ожидание данных')
         self.market_title = tk.StringVar()
         self.root.title('Задание 6 — Курсы криптовалют')
-        icon_path = Path(__file__).resolve().parent / 'assets' / 'crypto.ico'
-        if icon_path.is_file():
-            try:
-                self.root.iconbitmap(str(icon_path))
-            except tk.TclError:
-                # Некоторые платформы Tk не поддерживают значки в формате ICO.
-                pass
+        set_window_icon(self.root)
         self.root.geometry('1000x760')
         self.root.minsize(920, 700)
         self.root.configure(background='#F3F6FA')
@@ -404,6 +551,88 @@ class CryptoApp:
             if timer_id is not None:
                 self.root.after_cancel(timer_id)
         self.root.destroy()
+
+
+# Исходная иконка ICO встроена без изменения байтов; внешний assets/crypto.ico не нужен.
+WINDOW_ICON_BASE64 = """
+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
+"""
+
+
+def set_window_icon(root):
+    """Windows загружает ICO в память; временный файл удаляется сразу после назначения."""
+    try:
+        with TemporaryDirectory(prefix='crypto-rates-icon-') as directory:
+            icon_path = Path(directory) / 'crypto.ico'
+            icon_path.write_bytes(base64.b64decode(WINDOW_ICON_BASE64))
+            root.iconbitmap(str(icon_path))
+    except (OSError, tk.TclError):
+        # Без доступа к temp или поддержки ICO остаётся стандартная иконка Tk.
+        pass
 
 
 def main():
