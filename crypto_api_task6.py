@@ -18,6 +18,9 @@ class Coin:
 COINS = (
     Coin('BTC', 'Bitcoin', 'XBTUSD', 'XXBTZUSD'),
     Coin('ETH', 'Ethereum', 'ETHUSD', 'XETHZUSD'),
+    Coin('USDT', 'Tether', 'USDTUSD', 'USDTZUSD'),
+    Coin('TON', 'Gram (Toncoin)', 'TONUSD', 'TONUSD'),
+    Coin('BNB', 'BNB', 'BNBUSD', 'BNBUSD'),
     Coin('SOL', 'Solana', 'SOLUSD', 'SOLUSD'),
     Coin('XRP', 'XRP', 'XRPUSD', 'XXRPZUSD'),
     Coin('DOGE', 'Dogecoin', 'DOGEUSD', 'XDGUSD'),

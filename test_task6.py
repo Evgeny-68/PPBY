@@ -25,6 +25,9 @@ def ticker_payload():
     values = {
         'XXBTZUSD': ('60000.10', '59000.01', '61000.02'),
         'XETHZUSD': ('3000.25', '2900.03', '3100.04'),
+        'USDTZUSD': ('1.0003', '0.9991', '1.0012'),
+        'TONUSD': ('2.34878', '2.20', '2.50'),
+        'BNBUSD': ('605.45', '600.10', '610.80'),
         'SOLUSD': ('140.05', '135.06', '145.07'),
         'XXRPZUSD': ('0.52', '0.50', '0.55'),
         'XDGUSD': ('0.000000123456789', '0.0000001', '0.0000002'),
@@ -44,13 +47,21 @@ def ticker_payload():
 
 
 class ParseQuotesTests(unittest.TestCase):
-    def test_maps_all_five_pairs_to_user_facing_symbols(self):
+    def test_maps_all_eight_pairs_to_user_facing_symbols(self):
         quotes = parse_quotes(ticker_payload())
         self.assertEqual(
             [(quote.symbol, quote.name) for quote in quotes],
-            [('BTC', 'Bitcoin'), ('ETH', 'Ethereum'), ('SOL', 'Solana'),
+            [('BTC', 'Bitcoin'), ('ETH', 'Ethereum'), ('USDT', 'Tether'),
+             ('TON', 'Gram (Toncoin)'), ('BNB', 'BNB'), ('SOL', 'Solana'),
              ('XRP', 'XRP'), ('DOGE', 'Dogecoin')],
         )
+
+    def test_ton_and_bnb_prices_come_from_their_usd_markets(self):
+        quotes = {quote.symbol: quote for quote in parse_quotes(ticker_payload())}
+        self.assertEqual(quotes['TON'].price, Decimal('2.34878'))
+        self.assertEqual(quotes['TON'].low_24h, Decimal('2.20'))
+        self.assertEqual(quotes['BNB'].price, Decimal('605.45'))
+        self.assertEqual(quotes['BNB'].high_24h, Decimal('610.80'))
 
     def test_uses_last_trade_and_24_hour_range(self):
         quote = parse_quotes(ticker_payload())[0]
@@ -66,7 +77,7 @@ class ParseQuotesTests(unittest.TestCase):
     def test_ignores_unrequested_markets(self):
         payload = ticker_payload()
         payload['result']['UNREQUESTED'] = {'not': 'a ticker'}
-        self.assertEqual(len(parse_quotes(payload)), 5)
+        self.assertEqual(len(parse_quotes(payload)), 8)
 
     def test_rejects_missing_coin_instead_of_returning_partial_result(self):
         payload = ticker_payload()
@@ -146,12 +157,25 @@ class KrakenClientTests(unittest.TestCase):
         KrakenClient().fetch_quotes()
         self.get.assert_called_once_with(
             'https://api.kraken.com/0/public/Ticker',
-            params={'pair': 'XBTUSD,ETHUSD,SOLUSD,XRPUSD,DOGEUSD'},
+            params={'pair': 'XBTUSD,ETHUSD,USDTUSD,TONUSD,BNBUSD,SOLUSD,XRPUSD,DOGEUSD'},
             headers={'Accept': 'application/json'},
             timeout=(5, 10),
         )
         self.response.raise_for_status.assert_called_once()
         self.response.json.assert_called_once()
+
+    def test_usdt_uses_usd_market_value_instead_of_constant_one(self):
+        for market_price in ('1.0003', '0.9998'):
+            with self.subTest(market_price=market_price):
+                payload = ticker_payload()
+                payload['result']['USDTZUSD']['c'][0] = market_price
+                self.response.json.return_value = payload
+                snapshot = KrakenClient().fetch_quotes()
+                quote = next(quote for quote in snapshot.quotes if quote.symbol == 'USDT')
+                self.assertEqual(quote.price, Decimal(market_price))
+                pairs = self.get.call_args.kwargs['params']['pair'].split(',')
+                self.assertIn('USDTUSD', pairs)
+                self.assertNotIn('USDTUSDT', pairs)
 
     def test_returns_snapshot_with_aware_receipt_time(self):
         before = datetime.now(timezone.utc)
@@ -159,7 +183,7 @@ class KrakenClientTests(unittest.TestCase):
         after = datetime.now(timezone.utc)
         self.assertIsInstance(snapshot, Snapshot)
         self.assertEqual(snapshot.source, 'Kraken')
-        self.assertEqual(len(snapshot.quotes), 5)
+        self.assertEqual(len(snapshot.quotes), 8)
         self.assertIsNotNone(snapshot.received_at.utcoffset())
         self.assertLessEqual(before, snapshot.received_at)
         self.assertLessEqual(snapshot.received_at, after)
@@ -256,7 +280,7 @@ class WorkerAndWindowTests(unittest.TestCase):
         window.table.item.assert_not_called()
         self.assertIsNone(window.snapshot)
 
-    def test_success_updates_five_rows_and_receipt_time(self):
+    def test_success_updates_eight_rows_and_receipt_time(self):
         window = object.__new__(gui.CryptoApp)
         window.snapshot, window.busy = None, True
         window.status, window.received, window.table = Mock(), Mock(), Mock()
@@ -266,13 +290,14 @@ class WorkerAndWindowTests(unittest.TestCase):
             source='Test Exchange',
         )
         window._show_result(snapshot, None)
-        self.assertEqual(window.table.item.call_count, 5)
+        self.assertEqual(window.table.item.call_count, 8)
         self.assertIs(window.snapshot, snapshot)
         window.received.set.assert_called_once_with('Данные получены: 01.01.2026 03:00:00 МСК')
         window.source.set.assert_called_once_with(
             'Источник: Test Exchange  •  Валюта котировки: доллар США (USD)'
         )
         self.assertIn('Test Exchange', window.price_note.set.call_args.args[0])
+        window.status.set.assert_called_once_with('Обновлены котировки: 8.')
 
     def test_busy_and_rate_limit_prevent_duplicate_requests(self):
         window = object.__new__(gui.CryptoApp)
@@ -295,6 +320,12 @@ class WorkerAndWindowTests(unittest.TestCase):
         text = gui.format_price(Decimal('0.000000123456789'))
         self.assertGreater(Decimal(text), 0)
         self.assertEqual(Decimal(text), Decimal('0.000000123457'))
+
+    def test_display_preserves_usdt_deviation_and_prices_below_ten(self):
+        self.assertEqual(gui.format_price(Decimal('1.0003')), '1.0003')
+        self.assertEqual(gui.format_price(Decimal('0.9998')), '0.9998')
+        self.assertEqual(gui.format_price(Decimal('2.34878')), '2.34878')
+        self.assertEqual(gui.format_price(Decimal('10.123456')), '10.12')
 
     def test_poll_refreshes_only_when_enabled_due_and_idle(self):
         scenarios = (

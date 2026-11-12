@@ -21,8 +21,8 @@ MOSCOW_TIME = timezone(timedelta(hours=3))
 
 
 def format_price(value: Decimal):
-    """Для небольших цен сохраняем шесть значащих цифр вместо нуля."""
-    if value >= 1:
+    """До 10 USD сохраняем шесть значащих цифр, в том числе отклонения USDT от 1."""
+    if value >= 10:
         return f'{value:,.2f}'.replace(',', ' ')
     return format(value, '.6g')
 
@@ -58,8 +58,8 @@ class CryptoApp:
             value='Цена — последняя сделка на Kraken. Время получения не является временем сделки.'
         )
         self.root.title('Задание 6 — Курсы криптовалют')
-        self.root.geometry('920x560')
-        self.root.minsize(880, 560)
+        self.root.geometry('920x650')
+        self.root.minsize(880, 650)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self._build_interface()
         self.start_id = self.root.after(100, self.refresh)
@@ -70,7 +70,7 @@ class CryptoApp:
         style.theme_use('clam')
         style.configure('.', font=('Segoe UI', 10))
         style.configure('Title.TLabel', font=('Segoe UI', 20, 'bold'))
-        style.configure('Treeview', rowheight=42, font=('Segoe UI', 11))
+        style.configure('Treeview', rowheight=34, font=('Segoe UI', 11))
         style.configure('Treeview.Heading', font=('Segoe UI', 10, 'bold'))
         style.configure('Note.TLabel', foreground='#526174')
         style.configure('Status.TLabel', foreground='#234A70')
@@ -93,7 +93,7 @@ class CryptoApp:
         ).pack(side='left', padx=20)
 
         columns = ('name', 'symbol', 'price', 'low', 'high')
-        self.table = ttk.Treeview(frame, columns=columns, show='headings', height=5)
+        self.table = ttk.Treeview(frame, columns=columns, show='headings', height=len(COINS))
         for column, title, width, anchor in (
             ('name', 'Криптовалюта', 175, 'w'),
             ('symbol', 'Тикер', 75, 'center'),
@@ -158,7 +158,7 @@ class CryptoApp:
             ))
         received = snapshot.received_at.astimezone(MOSCOW_TIME).strftime('%d.%m.%Y %H:%M:%S')
         self.received.set(f'Данные получены: {received} МСК')
-        self.status.set('Все пять котировок обновлены.')
+        self.status.set(f'Обновлены котировки: {len(snapshot.quotes)}.')
 
     def _poll(self):
         if self.closed:
