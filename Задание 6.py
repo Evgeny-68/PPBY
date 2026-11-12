@@ -397,6 +397,13 @@ def format_percent(value):
     return f'{value:+.{digits}f}%'
 
 
+def history_time_ticks(snapshot_time):
+    """Ось графика привязана к снимку данных, а не к текущим часам компьютера."""
+    start = snapshot_time - timedelta(hours=24)
+    moments = tuple(start + timedelta(hours=6 * step) for step in range(5))
+    return tuple((moment, moment.astimezone(MOSCOW_TIME).strftime('%H:%M')) for moment in moments)
+
+
 def fetch_in_worker(provider, results):
     """Поток работает только с сетью и очередью, не обращается к Tkinter."""
     try:
@@ -567,16 +574,22 @@ class CryptoApp:
         frame.pack(fill='both', expand=True)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(4, weight=1)
-        header = ttk.Frame(frame, style='App.TFrame')
+        top_frame = ttk.Frame(frame, style='App.TFrame')
+        top_frame.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 10))
+        top_frame.columnconfigure(0, weight=1)
+        left_top = ttk.Frame(top_frame, style='App.TFrame')
+        left_top.grid(row=0, column=0, sticky='new', padx=(0, 16))
+        left_top.columnconfigure(0, weight=1)
+        header = ttk.Frame(left_top, style='App.TFrame')
         header.grid(row=0, column=0, sticky='ew', pady=(0, 9))
         ttk.Label(header, text='Курсы криптовалют', style='Title.TLabel').pack(anchor='w')
         ttk.Label(header, textvariable=self.source, style='Note.TLabel').pack(anchor='w', pady=(2, 0))
 
-        controls = ttk.Frame(frame, style='App.TFrame')
-        controls.grid(row=1, column=0, sticky='ew', pady=(0, 10))
+        controls = ttk.Frame(left_top, style='App.TFrame')
+        controls.grid(row=1, column=0, sticky='ew')
         controls.columnconfigure(0, weight=1)
         left_controls = ttk.Frame(controls, style='App.TFrame')
-        left_controls.grid(row=0, column=0, sticky='new', padx=(0, 16))
+        left_controls.grid(row=0, column=0, sticky='new')
         left_controls.columnconfigure(0, weight=1)
         left_controls.columnconfigure(1, weight=1)
         ttk.Label(left_controls, text='Криптовалюта', style='Field.TLabel').grid(row=0, column=0, sticky='w', pady=(0, 5))
@@ -603,7 +616,7 @@ class CryptoApp:
         self.chart_note_label.grid(row=3, column=0, columnspan=2, sticky='w', pady=(16, 0))
         left_controls.bind('<Configure>', lambda event: self.chart_note_label.configure(
             wraplength=max(200, event.width)))
-        chart_frame = ttk.Frame(controls, style='App.TFrame')
+        chart_frame = ttk.Frame(top_frame, style='App.TFrame')
         chart_frame.grid(row=0, column=1, sticky='ne')
         ttk.Label(chart_frame, text='Динамика курсов', style='Section.TLabel').pack(anchor='w')
         ttk.Label(chart_frame, textvariable=self.chart_title, style='Note.TLabel').pack(anchor='w', pady=(1, 0))
@@ -624,7 +637,7 @@ class CryptoApp:
         self.root.bind('<Control-r>', lambda event: self.refresh())
 
         card_border = tk.Frame(frame, background='#DDE6EE', padx=1, pady=1)
-        card_border.grid(row=2, column=0, sticky='ew')
+        card_border.grid(row=2, column=0, columnspan=2, sticky='ew')
         card = ttk.Frame(card_border, style='Card.TFrame', padding=(20, 10))
         card.pack(fill='both', expand=True)
         card.columnconfigure(0, weight=1)
@@ -649,11 +662,11 @@ class CryptoApp:
         card.bind('<Configure>', self._fit_card_price)
 
         table_header = ttk.Frame(frame, style='App.TFrame')
-        table_header.grid(row=3, column=0, sticky='ew', pady=(12, 6))
+        table_header.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(12, 6))
         ttk.Label(table_header, textvariable=self.market_title, style='Section.TLabel').pack(side='left')
         ttk.Label(table_header, text='Выберите строку для просмотра пары', style='Note.TLabel').pack(side='right')
         table_frame = ttk.Frame(frame, style='App.TFrame')
-        table_frame.grid(row=4, column=0, sticky='nsew')
+        table_frame.grid(row=4, column=0, columnspan=2, sticky='nsew')
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
         columns = ('name', 'symbol', 'price', 'low', 'high', 'availability')
@@ -677,7 +690,7 @@ class CryptoApp:
         self.table.bind('<<TreeviewSelect>>', self._on_table_selected)
 
         footer = ttk.Frame(frame, style='App.TFrame')
-        footer.grid(row=5, column=0, sticky='ew', pady=(11, 0))
+        footer.grid(row=5, column=0, columnspan=2, sticky='ew', pady=(11, 0))
         self.status_label = ttk.Label(footer, textvariable=self.status, style='Status.TLabel', wraplength=850)
         self.status_label.pack(anchor='w')
         receipt_row = ttk.Frame(footer, style='App.TFrame')
@@ -985,7 +998,7 @@ class CryptoApp:
         minimum, maximum = min(Decimal('0'), min(values)), max(Decimal('0'), max(values))
         padding = (maximum - minimum) * Decimal('0.12') if maximum != minimum else Decimal('1')
         minimum, maximum = minimum - padding, maximum + padding
-        left, right, top, bottom = 57, width - 12, 10, height - 23
+        left, right, top, bottom = 57, width - 12, 10, height - 42
         for step in range(5):
             level = minimum + (maximum - minimum) * Decimal(step) / 4
             y = bottom - step / 4 * (bottom - top)
@@ -1012,8 +1025,20 @@ class CryptoApp:
             canvas.create_line(*coordinates, **options)
             x, y = coordinates[-2:]
             canvas.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill=color, outline='')
-        canvas.create_text(left, height - 8, text='24 ч назад', anchor='w', fill='#7A8B9A', font=('Segoe UI', 7))
-        canvas.create_text(right, height - 8, text='сейчас', anchor='e', fill='#7A8B9A', font=('Segoe UI', 7))
+        ticks = history_time_ticks(end)
+        for index, (moment, label) in enumerate(ticks):
+            x = left + index / 4 * (right - left)
+            canvas.create_line(x, top, x, bottom, fill='#E7EDF3', tags=('time_grid',))
+            # Сетка позади ценовых линий, подписи остаются на своём времени снимка.
+            canvas.tag_lower('time_grid')
+            canvas.create_text(x, height - 25, text=label,
+                               anchor='w' if index == 0 else 'e' if index == 4 else 'center',
+                               fill='#64788C', font=('Segoe UI', 7), tags=('time_tick',))
+        for x, moment, anchor in ((left, ticks[0][0], 'w'), (right, ticks[-1][0], 'e')):
+            canvas.create_text(x, height - 9, text=moment.astimezone(MOSCOW_TIME).strftime('%d.%m.%Y'),
+                               anchor=anchor, fill='#7A8B9A', font=('Segoe UI', 7), tags=('time_date',))
+        canvas.create_text((left + right) / 2, height - 9, text='МСК',
+                           fill='#7A8B9A', font=('Segoe UI', 7), tags=('time_zone',))
 
     def refresh(self):
         if self.closed or self.busy:
