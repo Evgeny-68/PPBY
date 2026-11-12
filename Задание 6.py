@@ -1,4 +1,4 @@
-"""Задание 6. Окно котировок криптовалют к USD на основе публичного Kraken API.
+"""Задание 6. Прямые котировки Bybit отдельно к USD и USDT.
 
 Запуск: python "Задание 6.py"
 Зависимости: python -m pip install -r requirements_task6.txt
@@ -12,7 +12,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from crypto_api_task6 import COINS, KrakenClient, QuoteError
+from crypto_api_task6 import COINS, QUOTE_CURRENCIES, BybitClient, QuoteError
 
 
 AUTO_REFRESH_SECONDS = 60
@@ -21,7 +21,7 @@ MOSCOW_TIME = timezone(timedelta(hours=3))
 
 
 def format_price(value: Decimal):
-    """До 10 USD сохраняем шесть значащих цифр, в том числе отклонения USDT от 1."""
+    """До 10 единиц валюты сохраняем шесть значащих цифр, включая USDT/USD."""
     if value >= 10:
         return f'{value:,.2f}'.replace(',', ' ')
     return format(value, '.6g')
@@ -41,7 +41,7 @@ def fetch_in_worker(provider, results):
 class CryptoApp:
     def __init__(self, root, provider=None):
         self.root = root
-        self.provider = provider if provider is not None else KrakenClient()
+        self.provider = provider if provider is not None else BybitClient()
         self.results = Queue()
         self.busy = False
         self.closed = False
@@ -53,13 +53,13 @@ class CryptoApp:
         self.auto_refresh = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value='Ожидание первого запроса…')
         self.received = tk.StringVar(value='Данные ещё не получены')
-        self.source = tk.StringVar(value='Источник: Kraken  •  Валюта котировки: доллар США (USD)')
+        self.source = tk.StringVar(value='Источник: Bybit  •  Прямые спотовые пары')
         self.price_note = tk.StringVar(
-            value='Цена — последняя сделка на Kraken. Время получения не является временем сделки.'
+            value='Цена — последняя сделка на Bybit. Время получения не является временем сделки.'
         )
         self.root.title('Задание 6 — Курсы криптовалют')
-        self.root.geometry('920x650')
-        self.root.minsize(880, 650)
+        self.root.geometry('920x700')
+        self.root.minsize(880, 700)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
         self._build_interface()
         self.start_id = self.root.after(100, self.refresh)
@@ -92,25 +92,40 @@ class CryptoApp:
             variable=self.auto_refresh,
         ).pack(side='left', padx=20)
 
-        columns = ('name', 'symbol', 'price', 'low', 'high')
-        self.table = ttk.Treeview(frame, columns=columns, show='headings', height=len(COINS))
-        for column, title, width, anchor in (
-            ('name', 'Криптовалюта', 175, 'w'),
-            ('symbol', 'Тикер', 75, 'center'),
-            ('price', 'Цена, USD', 170, 'e'),
-            ('low', 'Мин. за 24 ч, USD', 175, 'e'),
-            ('high', 'Макс. за 24 ч, USD', 175, 'e'),
-        ):
-            self.table.heading(column, text=title, anchor=anchor)
-            self.table.column(column, width=width, minwidth=width, anchor=anchor)
-        self.table.tag_configure('stripe', background='#EEF3F8')
-        for index, coin in enumerate(COINS):
-            tags = ('stripe',) if index % 2 == 0 else ()
-            self.table.insert(
-                '', 'end', iid=coin.symbol,
-                values=(coin.name, coin.symbol, '—', '—', '—'), tags=tags,
+        self.notebook = ttk.Notebook(frame)
+        self.tables = {}
+        tab_names = {'USD': 'USD — доллар США', 'USDT': 'USDT — Tether'}
+        for currency in QUOTE_CURRENCIES:
+            tab = ttk.Frame(self.notebook, padding=4)
+            self.notebook.add(tab, text=tab_names[currency])
+            columns = ('name', 'symbol', 'price', 'low', 'high')
+            table = ttk.Treeview(
+                tab, columns=columns, show='headings', height=len(COINS),
             )
-        self.table.pack(fill='x')
+            for column, title, width, anchor in (
+                ('name', 'Криптовалюта', 175, 'w'),
+                ('symbol', 'Тикер', 75, 'center'),
+                ('price', f'Цена, {currency}', 170, 'e'),
+                ('low', f'Мин. 24 ч, {currency}', 175, 'e'),
+                ('high', f'Макс. 24 ч, {currency}', 175, 'e'),
+            ):
+                table.heading(column, text=title, anchor=anchor)
+                table.column(column, width=width, minwidth=width, anchor=anchor)
+            table.tag_configure('stripe', background='#EEF3F8')
+            for index, coin in enumerate(COINS):
+                tags = ('stripe',) if index % 2 == 0 else ()
+                price = 'Валюта котировки' if coin.symbol == currency else '—'
+                table.insert(
+                    '', 'end', iid=f'{coin.symbol}:{currency}',
+                    values=(coin.name, coin.symbol, price, '—', '—'), tags=tags,
+                )
+            table.pack(fill='x')
+            self.tables[currency] = table
+        self.notebook.pack(fill='x')
+        ttk.Label(
+            frame, text='USD — доллар США; USDT — токен Tether. Пересчёт между ними не выполняется.',
+            style='Note.TLabel', wraplength=820,
+        ).pack(anchor='w', pady=(10, 0))
 
         self.status_label = ttk.Label(
             frame, textvariable=self.status, style='Status.TLabel', wraplength=820,
@@ -143,22 +158,32 @@ class CryptoApp:
             if self.snapshot is None:
                 self.status.set(f'Данные не получены. {error}')
             else:
-                self.status.set(f'Обновление не выполнено; показаны устаревшие данные. {error}')
+                self.status.set(
+                    f'Обновление не выполнено; показаны устаревшие данные в обеих вкладках. {error}'
+                )
             return
 
         self.snapshot = snapshot
-        self.source.set(f'Источник: {snapshot.source}  •  Валюта котировки: доллар США (USD)')
+        self.source.set(f'Источник: {snapshot.source}  •  Прямые спотовые пары')
         self.price_note.set(
             f'Цена — последняя сделка на {snapshot.source}. Время получения не является временем сделки.'
         )
         for quote in snapshot.quotes:
-            self.table.item(quote.symbol, values=(
-                quote.name, quote.symbol, format_price(quote.price),
-                format_price(quote.low_24h), format_price(quote.high_24h),
+            if quote.status == 'quote_currency':
+                price, low, high = 'Валюта котировки', '—', '—'
+            elif quote.status == 'missing':
+                price, low, high = 'Нет данных по паре', '—', '—'
+            else:
+                price = format_price(quote.price)
+                low, high = format_price(quote.low_24h), format_price(quote.high_24h)
+            self.tables[quote.currency].item(quote.row_id, values=(
+                quote.name, quote.symbol, price, low, high,
             ))
         received = snapshot.received_at.astimezone(MOSCOW_TIME).strftime('%d.%m.%Y %H:%M:%S')
         self.received.set(f'Данные получены: {received} МСК')
-        self.status.set(f'Обновлены котировки: {len(snapshot.quotes)}.')
+        available = sum(quote.status == 'available' for quote in snapshot.quotes)
+        missing = sum(quote.status == 'missing' for quote in snapshot.quotes)
+        self.status.set(f'Обновлены прямые пары: {available}. Нет данных по парам: {missing}.')
 
     def _poll(self):
         if self.closed:

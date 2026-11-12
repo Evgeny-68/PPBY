@@ -1,4 +1,4 @@
-"""Получение публичных цен Kraken и преобразование JSON в данные приложения."""
+"""Публичные спотовые цены Bybit с раздельными валютами котировки USD и USDT."""
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,36 +11,41 @@ import requests
 class Coin:
     symbol: str
     name: str
-    pair: str
-    response_key: str
 
 
 COINS = (
-    Coin('BTC', 'Bitcoin', 'XBTUSD', 'XXBTZUSD'),
-    Coin('ETH', 'Ethereum', 'ETHUSD', 'XETHZUSD'),
-    Coin('USDT', 'Tether', 'USDTUSD', 'USDTZUSD'),
-    Coin('TON', 'Gram (Toncoin)', 'TONUSD', 'TONUSD'),
-    Coin('BNB', 'BNB', 'BNBUSD', 'BNBUSD'),
-    Coin('SOL', 'Solana', 'SOLUSD', 'SOLUSD'),
-    Coin('XRP', 'XRP', 'XRPUSD', 'XXRPZUSD'),
-    Coin('DOGE', 'Dogecoin', 'DOGEUSD', 'XDGUSD'),
+    Coin('BTC', 'Bitcoin'),
+    Coin('ETH', 'Ethereum'),
+    Coin('USDT', 'Tether'),
+    Coin('GRAM', 'Gram (Toncoin)'),
+    Coin('BNB', 'BNB'),
+    Coin('SOL', 'Solana'),
+    Coin('XRP', 'XRP'),
+    Coin('DOGE', 'Dogecoin'),
 )
+QUOTE_CURRENCIES = ('USD', 'USDT')
 
 
 @dataclass(frozen=True)
 class Quote:
     symbol: str
     name: str
-    price: Decimal
-    low_24h: Decimal
-    high_24h: Decimal
+    currency: str
+    price: Decimal | None = None
+    low_24h: Decimal | None = None
+    high_24h: Decimal | None = None
+    status: str = 'available'
+
+    @property
+    def row_id(self):
+        return f'{self.symbol}:{self.currency}'
 
 
 @dataclass(frozen=True)
 class Snapshot:
     quotes: tuple[Quote, ...]
     received_at: datetime
-    source: str = 'Kraken'
+    source: str = 'Bybit'
 
 
 class QuoteError(Exception):
@@ -59,48 +64,76 @@ def positive_decimal(value):
 
 
 def parse_quotes(data):
-    """Названия полей Kraken остаются внутри адаптера, вне интерфейса."""
-    if not isinstance(data, dict) or not isinstance(data.get('error'), list):
+    """Нормализуем только точные пары; отсутствующие пары не пересчитываем."""
+    if not isinstance(data, dict) or type(data.get('retCode')) is not int:
         raise QuoteError('Сервис вернул неверный формат данных.')
-    if data['error']:
-        if any('Rate limit' in str(error) for error in data['error']):
+    if data['retCode'] != 0:
+        if data['retCode'] in (10006, 10018):
             raise QuoteError('Слишком много запросов. Повторите попытку позднее.')
-        raise QuoteError('Kraken сообщил об ошибке. Повторите попытку позднее.')
+        raise QuoteError('Bybit сообщил об ошибке. Повторите попытку позднее.')
     result = data.get('result')
-    if not isinstance(result, dict):
-        raise QuoteError('В ответе сервиса отсутствуют котировки.')
+    if not isinstance(result, dict) or result.get('category') != 'spot':
+        raise QuoteError('Сервис вернул неверный формат спотовых котировок.')
+    items = result.get('list')
+    if not isinstance(items, list) or not items:
+        raise QuoteError('Сервис вернул пустой или неверный список котировок.')
+
+    allowed_pairs = {
+        coin.symbol + currency
+        for currency in QUOTE_CURRENCIES
+        for coin in COINS
+        if coin.symbol != currency
+    }
+    prices = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise QuoteError('Сервис вернул неверную запись котировки.')
+        symbol = item.get('symbol')
+        if not isinstance(symbol, str) or not symbol:
+            raise QuoteError('Сервис не указал символ торговой пары.')
+        # Например, BTCUSDT и BTCUSD — разные рынки. Совпадения по суффиксу нет.
+        if symbol not in allowed_pairs:
+            continue
+        if symbol in prices:
+            raise QuoteError(f'Сервис вернул повторяющиеся данные пары {symbol}.')
+        try:
+            price = positive_decimal(item['lastPrice'])
+            low = positive_decimal(item['lowPrice24h'])
+            high = positive_decimal(item['highPrice24h'])
+        except KeyError:
+            raise QuoteError(f'Некорректные данные пары {symbol}.') from None
+        if low > high:
+            raise QuoteError(f'Некорректный диапазон цен пары {symbol}.')
+        prices[symbol] = (price, low, high)
+
+    if not prices:
+        raise QuoteError('В ответе сервиса нет данных выбранных торговых пар.')
 
     quotes = []
-    for coin in COINS:
-        item = result.get(coin.response_key)
-        if not isinstance(item, dict):
-            raise QuoteError(f'В ответе сервиса отсутствует курс {coin.symbol}.')
-        try:
-            # c[0] — последняя сделка; l[1] и h[1] — минимум/максимум за 24 ч.
-            fields = (item['c'], item['l'], item['h'])
-            if any(not isinstance(field, list) for field in fields):
-                raise TypeError
-            price = positive_decimal(item['c'][0])
-            low = positive_decimal(item['l'][1])
-            high = positive_decimal(item['h'][1])
-        except (KeyError, IndexError, TypeError):
-            raise QuoteError(f'Некорректные данные для {coin.symbol}.') from None
-        if low > high:
-            raise QuoteError(f'Некорректный диапазон цен для {coin.symbol}.')
-        quotes.append(Quote(coin.symbol, coin.name, price, low, high))
+    for currency in QUOTE_CURRENCIES:
+        for coin in COINS:
+            pair = coin.symbol + currency
+            if coin.symbol == currency:
+                # USDT/USDT не является рыночным курсом и не показывается как 1.
+                quote = Quote(coin.symbol, coin.name, currency, status='quote_currency')
+            elif pair not in prices:
+                quote = Quote(coin.symbol, coin.name, currency, status='missing')
+            else:
+                quote = Quote(coin.symbol, coin.name, currency, *prices[pair])
+            quotes.append(quote)
     return tuple(quotes)
 
 
-class KrakenClient:
+class BybitClient:
     """Адаптер источника: другой API может реализовать тот же fetch_quotes()."""
 
-    url = 'https://api.kraken.com/0/public/Ticker'
+    url = 'https://api.bybit.com/v5/market/tickers'
 
     def fetch_quotes(self):
         try:
             response = requests.get(
                 self.url,
-                params={'pair': ','.join(coin.pair for coin in COINS)},
+                params={'category': 'spot'},
                 headers={'Accept': 'application/json'},
                 timeout=(5, 10),
             )
