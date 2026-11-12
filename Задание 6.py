@@ -6,6 +6,7 @@
 
 from datetime import timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
 import time
@@ -58,6 +59,13 @@ class CryptoApp:
             value='Цена — последняя сделка на Bybit. Время получения не является временем сделки.'
         )
         self.root.title('Задание 6 — Курсы криптовалют')
+        icon_path = Path(__file__).resolve().parent / 'assets' / 'crypto.ico'
+        if icon_path.is_file():
+            try:
+                self.root.iconbitmap(str(icon_path))
+            except tk.TclError:
+                # Некоторые платформы Tk не поддерживают значки в формате ICO.
+                pass
         self.root.geometry('920x700')
         self.root.minsize(880, 700)
         self.root.protocol('WM_DELETE_WINDOW', self.close)
