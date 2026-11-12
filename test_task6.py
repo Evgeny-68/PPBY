@@ -83,6 +83,17 @@ def history_payload(symbol='BTCUSD', now=TEST_TIME, value='10'):
             'result': {'category': 'spot', 'symbol': symbol, 'list': candles}}
 
 
+def example_history(currency='USD', values=('100', '110', '105'), *,
+                    symbol='BTC', now=TEST_TIME, calculated=False, fx_date=None):
+    """Разные масштабы цен позволяют проверить сопоставление доходностей."""
+    points = tuple(
+        gui.HistoryPoint(now - timedelta(hours=len(values) - index - 1),
+                         Decimal(value), index == len(values) - 1)
+        for index, value in enumerate(values)
+    )
+    return gui.HistorySeries((symbol, currency), points, now, calculated, fx_date)
+
+
 class ParseQuotesTests(unittest.TestCase):
     def test_returns_eight_assets_in_all_twelve_currencies(self):
         quotes = parse_quotes(ticker_payload())
@@ -584,6 +595,131 @@ class HistoryTests(unittest.TestCase):
         request.assert_not_called()
 
 
+class ComparisonTests(unittest.TestCase):
+    def comparison(self, *histories, errors=()):
+        return gui.ComparisonHistory('BTC', tuple(histories), TEST_TIME, errors)
+
+    def quotes(self, with_fx=True, direct_eur=False):
+        payload = ticker_payload()
+        if direct_eur:
+            payload['result']['list'].append({
+                'symbol': 'BTCEUR', 'lastPrice': '54001',
+                'lowPrice24h': '53000', 'highPrice24h': '55000',
+            })
+        all_quotes = parse_quotes(payload, example_fx() if with_fx else None)
+        return tuple(q for currency in ('USD', 'EUR') for q in all_quotes
+                     if q.symbol == 'BTC' and q.currency == currency)
+
+    def test_normalization_compares_percentage_changes_not_absolute_prices(self):
+        result = gui.normalize_comparison(self.comparison(
+            example_history('USD'), example_history('EUR', ('200', '218', '208')),
+        ))
+        self.assertEqual(tuple(result), ('USD', 'EUR'))
+        self.assertEqual([value for _, value in result['USD']], [0, 10, 5])
+        self.assertEqual([value for _, value in result['EUR']], [0, 9, 4])
+        self.assertEqual([moment for moment, _ in result['USD']],
+                         [moment for moment, _ in result['EUR']])
+
+    def test_both_lines_start_at_first_common_time_instead_of_zipping_rows(self):
+        result = gui.normalize_comparison(self.comparison(
+            example_history('USD', ('100', '110', '121')),
+            example_history('EUR', ('200', '240')),
+        ))
+        expected_times = [TEST_TIME - timedelta(hours=1), TEST_TIME]
+        self.assertEqual([moment for moment, _ in result['USD']], expected_times)
+        self.assertEqual([moment for moment, _ in result['EUR']], expected_times)
+        self.assertEqual([value for _, value in result['USD']], [0, 10])
+        self.assertEqual([value for _, value in result['EUR']], [0, 20])
+
+    def test_fewer_than_two_common_times_cannot_draw_a_comparison(self):
+        left = example_history()
+        right = example_history('EUR', now=TEST_TIME + timedelta(hours=2))
+        with self.assertRaises(QuoteError):
+            gui.normalize_comparison(self.comparison(left, right))
+
+    def test_fixed_fx_conversion_has_identical_trend_without_artificial_offset(self):
+        result = gui.normalize_comparison(self.comparison(
+            example_history('USD', ('100', '110', '105')),
+            example_history('EUR', ('90', '99', '94.5'),
+                            calculated=True, fx_date=example_fx().updated_at),
+        ))
+        self.assertEqual(result['USD'], result['EUR'])
+
+    def test_partial_comparison_normalizes_available_line_without_making_up_other(self):
+        result = gui.normalize_comparison(self.comparison(
+            example_history('USD'), errors=(('EUR', 'Нет истории'),),
+        ))
+        self.assertEqual(tuple(result), ('USD',))
+        self.assertEqual([value for _, value in result['USD']], [0, 10, 5])
+
+    def test_worker_loads_usd_and_direct_eur_with_one_snapshot_time(self):
+        quotes = self.quotes(direct_eur=True)
+        provider, results = Mock(), Queue()
+        histories = (example_history('USD'), example_history('EUR'))
+        provider.fetch_history.side_effect = histories
+        token = ('BTC', 7)
+        gui.fetch_comparison_in_worker(provider, quotes, TEST_TIME, results, token)
+        result_token, comparison, error = results.get_nowait()
+        self.assertEqual(result_token, token)
+        self.assertIsNone(error)
+        self.assertEqual(comparison.histories, histories)
+        self.assertEqual(comparison.received_at, TEST_TIME)
+        self.assertEqual(comparison.errors, ())
+        self.assertEqual([call.args for call in provider.fetch_history.call_args_list],
+                         [(quotes[0], TEST_TIME), (quotes[1], TEST_TIME)])
+        self.assertEqual(quotes[1].markets, ('BTCEUR',))
+        self.assertEqual(quotes[1].provenance, 'direct')
+
+    def test_worker_preserves_usd_when_eur_history_fails(self):
+        provider, results = Mock(), Queue()
+        usd = example_history('USD')
+        provider.fetch_history.side_effect = [usd, QuoteError('Нет истории EUR')]
+        gui.fetch_comparison_in_worker(provider, self.quotes(), TEST_TIME, results, ('BTC', 1))
+        _, comparison, error = results.get_nowait()
+        self.assertIsNone(error)
+        self.assertEqual(comparison.histories, (usd,))
+        self.assertIn(('EUR', 'Нет истории EUR'), comparison.errors)
+
+    def test_worker_does_not_request_missing_eur_price_or_assume_fx(self):
+        provider, results = Mock(), Queue()
+        quotes = self.quotes(with_fx=False)
+        usd = example_history('USD')
+        provider.fetch_history.return_value = usd
+        gui.fetch_comparison_in_worker(provider, quotes, TEST_TIME, results, ('BTC', 1))
+        _, comparison, error = results.get_nowait()
+        provider.fetch_history.assert_called_once_with(quotes[0], TEST_TIME)
+        self.assertIsNone(error)
+        self.assertEqual(comparison.histories, (usd,))
+        self.assertEqual([currency for currency, _ in comparison.errors], ['EUR'])
+
+    def test_worker_rejects_other_pair_or_snapshot_without_losing_valid_line(self):
+        usd = example_history('USD')
+        invalid_series = (
+            example_history('EUR', symbol='ETH'),
+            example_history('EUR', now=TEST_TIME - timedelta(seconds=1)),
+        )
+        for wrong in invalid_series:
+            with self.subTest(pair=wrong.pair_key, time=wrong.received_at):
+                provider, results = Mock(), Queue()
+                provider.fetch_history.side_effect = [usd, wrong]
+                gui.fetch_comparison_in_worker(provider, self.quotes(), TEST_TIME, results, ('BTC', 1))
+                _, comparison, error = results.get_nowait()
+                self.assertIsNone(error)
+                self.assertEqual(comparison.histories, (usd,))
+                self.assertEqual([currency for currency, _ in comparison.errors], ['EUR'])
+
+    def test_all_history_failures_deliver_error_without_internal_details(self):
+        provider, results = Mock(), Queue()
+        provider.fetch_history.side_effect = RuntimeError('private detail')
+        token = ('BTC', 1)
+        gui.fetch_comparison_in_worker(provider, self.quotes(), TEST_TIME, results, token)
+        result_token, comparison, error = results.get_nowait()
+        self.assertEqual(result_token, token)
+        self.assertIsNone(comparison)
+        self.assertTrue(error)
+        self.assertNotIn('private detail', error)
+
+
 class FakeVar:
     """Минимальная StringVar без создания окна Tk."""
     def __init__(self, value=''):
@@ -679,6 +815,7 @@ class WorkerAndWindowTests(unittest.TestCase):
         window.chart_series = None
         window.chart_message = ''
         window.chart_title, window.chart_caption = FakeVar(), FakeVar()
+        window.chart_legend_usd, window.chart_legend_eur = FakeVar(), FakeVar()
         window._draw_chart, window._fit_card_price = Mock(), Mock()
         return window
 
@@ -961,7 +1098,14 @@ class WorkerAndWindowTests(unittest.TestCase):
         self.assertEqual(window.table.rows['BTC:RUB'][3:5], ('—', '—'))
         self.assertIn('FX от', window.selection_hint.get())
         self.assertIn('не учитываются', window.selection_hint.get())
-        self.assertIn('Расчёт · FX от', window.chart_caption.get())
+        comparison = gui.ComparisonHistory('BTC', (
+            example_history('USD'),
+            example_history('EUR', calculated=True, fx_date=example_fx().updated_at),
+        ), TEST_TIME)
+        window._show_chart_result(window.chart_token, comparison, None)
+        self.assertIn('EUR', window.chart_caption.get())
+        self.assertIn('FX', window.chart_caption.get())
+        self.assertNotIn('RUB', window.chart_title.get())
 
     def test_initial_fx_failure_message_does_not_claim_a_cached_date(self):
         window = self.window()
@@ -978,7 +1122,12 @@ class WorkerAndWindowTests(unittest.TestCase):
         window._show_result(Snapshot(parse_quotes(ticker_payload(), fx), TEST_TIME,
                                     fx=fx, fx_error='Нет FX'), None)
         self.assertIn('FX устарел', window.card_state.get())
-        self.assertIn('устарело', window.chart_caption.get())
+        comparison = gui.ComparisonHistory('BTC', (
+            example_history('USD'),
+            gui.replace(example_history('EUR', calculated=True, fx_date=fx.updated_at), fx_stale=True),
+        ), TEST_TIME)
+        window._show_chart_result(window.chart_token, comparison, None)
+        self.assertIn('устар', window.chart_caption.get())
         window.currency_selection.set(gui.CURRENCY_LABELS['UZS'])
         window._on_currency_selected()
         self.assertIn('FX устарел', window.card_state.get())
@@ -989,26 +1138,62 @@ class WorkerAndWindowTests(unittest.TestCase):
         window = self.window()
         window._show_result(self.snapshot(received_at=TEST_TIME), None)
         old_token = window.chart_token
-        old_series = gui.HistorySeries(('BTC', 'USD'), (), TEST_TIME)
+        old_series = gui.ComparisonHistory('BTC', (example_history(),), TEST_TIME)
         window.chart_series = old_series
-        window.currency_selection.set(gui.CURRENCY_LABELS['USDT'])
-        window._on_currency_selected()
+        window.coin_selection.set(gui.COIN_LABELS['ETH'])
+        window._on_coin_selected()
         self.assertIsNone(window.chart_series)
         window._show_chart_result(old_token, old_series, None)
         self.assertIsNone(window.chart_series)
-        self.assertEqual(window.chart_token[:2], ('BTC', 'USDT'))
+        self.assertEqual(window.chart_token, ('ETH', window.snapshot_version))
+
+    def test_currency_selection_preserves_usd_eur_comparison_without_new_history_work(self):
+        window = self.window()
+        window._show_result(self.snapshot(received_at=TEST_TIME), None)
+        comparison = gui.ComparisonHistory('BTC', (example_history(),), TEST_TIME)
+        window._show_chart_result(window.chart_token, comparison, None)
+        token, pending = window.chart_token, window.chart_pending
+        title, caption = window.chart_title.get(), window.chart_caption.get()
+        window.root.after.reset_mock()
+        for currency in ('EUR', 'RUB', 'USDT'):
+            window.currency_selection.set(gui.CURRENCY_LABELS[currency])
+            window._on_currency_selected()
+            self.assertEqual(window.chart_token, token)
+            self.assertIs(window.chart_series, comparison)
+            self.assertIs(window.chart_pending, pending)
+            self.assertEqual(window.chart_title.get(), title)
+            self.assertEqual(window.chart_caption.get(), caption)
+        window.root.after.assert_not_called()
+        self.assertIn('BTC / USD / EUR', title)
+
+    def test_partial_comparison_keeps_available_line_and_marks_other_legend_unavailable(self):
+        window = self.window()
+        window._show_result(self.snapshot(received_at=TEST_TIME), None)
+        price, rows = window.price_text.get(), copy.deepcopy(window.table.rows)
+        comparison = gui.ComparisonHistory('BTC', (example_history(),), TEST_TIME,
+                                           (('EUR', 'Нет истории EUR'),))
+        window._show_chart_result(window.chart_token, comparison, None)
+        self.assertIs(window.chart_series, comparison)
+        self.assertEqual(window.chart_message, '')
+        self.assertIn('USD', window.chart_legend_usd.get())
+        self.assertIn('%', window.chart_legend_usd.get())
+        self.assertIn('EUR', window.chart_legend_eur.get())
+        self.assertNotIn('%', window.chart_legend_eur.get())
+        self.assertIn('EUR', window.chart_caption.get())
+        self.assertEqual(window.price_text.get(), price)
+        self.assertEqual(window.table.rows, rows)
 
     def test_chart_rejects_other_pair_and_previous_snapshot_even_with_current_token(self):
         window = self.window()
         window._show_result(self.snapshot(received_at=TEST_TIME), None)
         token = window.chart_token
-        for series in (gui.HistorySeries(('ETH', 'USD'), (), TEST_TIME),
-                       gui.HistorySeries(('BTC', 'USD'), (), TEST_TIME - timedelta(seconds=60))):
+        for series in (gui.ComparisonHistory('ETH', (example_history(symbol='ETH'),), TEST_TIME),
+                       gui.ComparisonHistory('BTC', (example_history(),), TEST_TIME - timedelta(seconds=60))):
             window._show_chart_result(token, series, None)
             self.assertIsNone(window.chart_series)
         window._show_result(self.snapshot(received_at=TEST_TIME + timedelta(seconds=60)), None)
         self.assertNotEqual(window.chart_token, token)
-        window._show_chart_result(token, gui.HistorySeries(('BTC', 'USD'), (), TEST_TIME), None)
+        window._show_chart_result(token, gui.ComparisonHistory('BTC', (example_history(),), TEST_TIME), None)
         self.assertIsNone(window.chart_series)
 
     def test_single_history_worker_keeps_only_latest_pending_selection(self):
@@ -1025,11 +1210,11 @@ class WorkerAndWindowTests(unittest.TestCase):
             window._on_coin_selected()
             window._start_chart_request()
             self.assertEqual(thread.call_count, 1)
-            self.assertEqual(window.chart_pending[0][:2], ('BNB', 'USD'))
+            self.assertEqual(window.chart_pending[0], ('BNB', window.snapshot_version))
             window.chart_results.put((old_token, None, 'Ошибка старой истории'))
             window._poll_chart_results()
             self.assertEqual(thread.call_count, 2)
-            self.assertEqual(window.chart_active_token[:2], ('BNB', 'USD'))
+            self.assertEqual(window.chart_active_token, ('BNB', window.snapshot_version))
             self.assertTrue(thread.call_args.kwargs['daemon'])
 
     def test_history_failure_changes_only_chart_not_quotes_or_receipt(self):
@@ -1041,13 +1226,13 @@ class WorkerAndWindowTests(unittest.TestCase):
         self.assertEqual(window.table.rows, rows)
         self.assertEqual(window.price_text.get(), price)
         self.assertEqual(window.received.history, receipt)
-        self.assertIn('Неполные', window.chart_caption.get())
+        self.assertIn('недоступ', window.chart_message.lower())
         self.assertFalse(window.stale)
 
     def test_history_worker_queues_unexpected_error_and_closing_rejects_response(self):
         provider, results = Mock(), Queue()
         provider.fetch_history.side_effect = RuntimeError('private detail')
-        token = ('BTC', 'USD', 1)
+        token = ('BTC', 1)
         gui.fetch_history_in_worker(provider, by_id()['BTC:USD'], TEST_TIME, results, token)
         result_token, series, error = results.get_nowait()
         self.assertEqual(result_token, token)

@@ -1,4 +1,4 @@
-"""Задание 6. Криптовалюты в 12 валютах и график цен за 24 часа.
+"""Задание 6. Криптовалюты в 12 валютах и сравнение USD/EUR за 24 часа.
 
 Прямые пары берутся с Bybit; расчётные цены и графики явно отмечают путь
 пересчёта и дату суточного курса ExchangeRate-API.
@@ -102,6 +102,14 @@ class HistorySeries:
     calculated: bool = False
     fx_date: datetime | None = None
     fx_stale: bool = False
+
+
+@dataclass(frozen=True)
+class ComparisonHistory:
+    symbol: str
+    histories: tuple[HistorySeries, ...]
+    received_at: datetime
+    errors: tuple[tuple[str, str], ...] = ()
 
 
 class QuoteError(Exception):
@@ -382,6 +390,13 @@ def format_price(value: Decimal):
     return format(value, '.6g')
 
 
+def format_percent(value):
+    """Малые изменения USDT остаются видимыми; для обычных достаточно сотых."""
+    digits = 2 if abs(value) >= Decimal('0.01') or value == 0 else (
+        3 if abs(value) >= Decimal('0.001') else 4)
+    return f'{value:+.{digits}f}%'
+
+
 def fetch_in_worker(provider, results):
     """Поток работает только с сетью и очередью, не обращается к Tkinter."""
     try:
@@ -404,6 +419,62 @@ def fetch_history_in_worker(provider, quote, snapshot_time, results, token):
         results.put((token, None, str(error)))
     except Exception:
         results.put((token, None, 'Не удалось получить историю торгов.'))
+
+
+def normalize_comparison(comparison):
+    """Сравниваем относительные изменения от одной общей точки во времени."""
+    prices = {}
+    for series in comparison.histories:
+        symbol, unit = series.pair_key
+        if (symbol != comparison.symbol or unit not in ('USD', 'EUR')
+                or unit in prices or series.received_at != comparison.received_at):
+            raise QuoteError('Несогласованные данные сравнения.')
+        by_time = {}
+        for point in series.points:
+            if point.timestamp in by_time:
+                raise QuoteError('Повторяющиеся моменты времени в сравнении.')
+            by_time[point.timestamp] = positive_decimal(point.close)
+        prices[unit] = by_time
+    if not prices:
+        raise QuoteError('Нет истории для сравнения.')
+    common = set.intersection(*(set(points) for points in prices.values()))
+    moments = sorted(common)
+    if len(moments) < 2:
+        raise QuoteError('Недостаточно общих точек для сравнения.')
+    return {unit: tuple((moment, (points[moment] / points[moments[0]] - 1) * 100)
+                       for moment in moments)
+            for unit, points in prices.items()}
+
+
+def fetch_comparison_in_worker(provider, quotes, snapshot_time, results, token):
+    """Один поток получает обе истории; отказ одной не скрывает вторую."""
+    histories, errors = [], []
+    for unit in ('USD', 'EUR'):
+        quote = next((item for item in quotes if item.currency == unit), None)
+        if quote is None or quote.status != 'available':
+            errors.append((unit, 'Нет данных для этой пары.'))
+            continue
+        try:
+            series = provider.fetch_history(quote, snapshot_time)
+            if (not isinstance(series, HistorySeries)
+                    or series.pair_key != (token[0], unit)
+                    or series.received_at != snapshot_time or len(series.points) < 2):
+                raise QuoteError('Сервис вернул неверный формат истории.')
+            normalize_comparison(ComparisonHistory(token[0], (series,), snapshot_time))
+            histories.append(series)
+        except QuoteError as error:
+            errors.append((unit, str(error)))
+        except Exception:
+            errors.append((unit, 'Не удалось получить историю торгов.'))
+    comparison = ComparisonHistory(token[0], tuple(histories), snapshot_time, tuple(errors))
+    try:
+        normalize_comparison(comparison)
+    except QuoteError as error:
+        results.put((token, None, str(error)))
+    except Exception:
+        results.put((token, None, 'Не удалось обработать историю сравнения.'))
+    else:
+        results.put((token, comparison, None))
 
 
 class CryptoApp:
@@ -437,7 +508,7 @@ class CryptoApp:
         self.received = tk.StringVar(value='Данные ещё не получены')
         self.source = tk.StringVar(value='Bybit · прямые пары и пересчёт через USD · 12 валют')
         self.price_note = tk.StringVar(
-            value='USD и USDT — разные валюты. Расчётные цены отмечены знаком ≈ и источником пересчёта.'
+            value='Расчётные цены отмечены знаком ≈. USD и USDT — разные валюты.'
         )
         self.pair_title = tk.StringVar()
         self.price_text = tk.StringVar()
@@ -446,11 +517,13 @@ class CryptoApp:
         self.selection_hint = tk.StringVar()
         self.card_state = tk.StringVar(value='Ожидание данных')
         self.market_title = tk.StringVar()
-        self.chart_title = tk.StringVar(value='BTC / USD · 24 часа')
-        self.chart_caption = tk.StringVar(value='История биржевых цен')
-        self.root.title('Задание 6 — Курсы криптовалют')
+        self.chart_title = tk.StringVar(value='BTC / USD / EUR · 24 часа')
+        self.chart_caption = tk.StringVar(value='Изменение от первой общей точки, %')
+        self.chart_legend_usd = tk.StringVar(value='USD —')
+        self.chart_legend_eur = tk.StringVar(value='EUR —')
+        self.root.title('Динамика курсов')
         set_window_icon(self.root)
-        self.root.geometry('1000x820')
+        self.root.geometry('1080x880')
         self.root.minsize(920, 700)
         self.root.configure(background='#F3F6FA')
         self.root.protocol('WM_DELETE_WINDOW', self.close)
@@ -490,54 +563,69 @@ class CryptoApp:
                         font=('Segoe UI', 9, 'bold'), padding=(8, 7))
         style.map('Treeview', background=[('selected', '#D9ECEF')], foreground=[('selected', '#123E49')])
 
-        frame = ttk.Frame(self.root, style='App.TFrame', padding=(24, 18))
+        frame = ttk.Frame(self.root, style='App.TFrame', padding=(24, 16))
         frame.pack(fill='both', expand=True)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(4, weight=1)
         header = ttk.Frame(frame, style='App.TFrame')
-        header.grid(row=0, column=0, sticky='ew', pady=(0, 15))
+        header.grid(row=0, column=0, sticky='ew', pady=(0, 9))
         ttk.Label(header, text='Курсы криптовалют', style='Title.TLabel').pack(anchor='w')
         ttk.Label(header, textvariable=self.source, style='Note.TLabel').pack(anchor='w', pady=(2, 0))
 
         controls = ttk.Frame(frame, style='App.TFrame')
-        controls.grid(row=1, column=0, sticky='ew', pady=(0, 16))
+        controls.grid(row=1, column=0, sticky='ew', pady=(0, 10))
         controls.columnconfigure(0, weight=1)
-        controls.columnconfigure(1, weight=1)
-        ttk.Label(controls, text='Криптовалюта', style='Field.TLabel').grid(row=0, column=0, sticky='w', pady=(0, 5))
-        ttk.Label(controls, text='Валюта', style='Field.TLabel').grid(row=0, column=1, sticky='w', padx=(16, 0), pady=(0, 5))
+        left_controls = ttk.Frame(controls, style='App.TFrame')
+        left_controls.grid(row=0, column=0, sticky='new', padx=(0, 16))
+        left_controls.columnconfigure(0, weight=1)
+        left_controls.columnconfigure(1, weight=1)
+        ttk.Label(left_controls, text='Криптовалюта', style='Field.TLabel').grid(row=0, column=0, sticky='w', pady=(0, 5))
+        ttk.Label(left_controls, text='Валюта', style='Field.TLabel').grid(row=0, column=1, sticky='w', padx=(16, 0), pady=(0, 5))
         self.coin_combobox = ttk.Combobox(
-            controls, textvariable=self.coin_selection, values=list(COIN_LABELS.values()),
-            state='readonly', width=27, takefocus=True,
+            left_controls, textvariable=self.coin_selection, values=list(COIN_LABELS.values()),
+            state='readonly', width=19, takefocus=True,
         )
         self.coin_combobox.grid(row=1, column=0, sticky='ew')
         self.currency_combobox = ttk.Combobox(
-            controls, textvariable=self.currency_selection, values=list(CURRENCY_LABELS.values()),
-            state='readonly', width=26, height=12, takefocus=True,
+            left_controls, textvariable=self.currency_selection, values=list(CURRENCY_LABELS.values()),
+            state='readonly', width=27, height=12, takefocus=True,
         )
-        self.currency_combobox.grid(row=1, column=1, sticky='ew', padx=(16, 16))
-        actions = ttk.Frame(controls, style='App.TFrame')
+        self.currency_combobox.grid(row=1, column=1, sticky='ew', padx=(16, 0))
+        actions = ttk.Frame(left_controls, style='App.TFrame')
         actions.grid(row=2, column=0, columnspan=2, sticky='w', pady=(12, 0))
         self.refresh_button = ttk.Button(actions, text='Обновить', style='Accent.TButton', command=self.refresh)
         self.refresh_button.pack(side='left')
         ttk.Checkbutton(
             actions, text='Обновлять каждые 60 секунд', variable=self.auto_refresh,
         ).pack(side='left', padx=(12, 0))
+        self.chart_note_label = ttk.Label(left_controls, textvariable=self.chart_caption,
+                                         style='Note.TLabel', wraplength=450)
+        self.chart_note_label.grid(row=3, column=0, columnspan=2, sticky='w', pady=(16, 0))
+        left_controls.bind('<Configure>', lambda event: self.chart_note_label.configure(
+            wraplength=max(200, event.width)))
         chart_frame = ttk.Frame(controls, style='App.TFrame')
-        chart_frame.grid(row=0, column=2, rowspan=3, sticky='nsew')
-        ttk.Label(chart_frame, textvariable=self.chart_title, style='Field.TLabel').pack(anchor='w')
-        self.chart_canvas = tk.Canvas(chart_frame, width=260, height=76, background='white',
+        chart_frame.grid(row=0, column=1, sticky='ne')
+        ttk.Label(chart_frame, text='Динамика курсов', style='Section.TLabel').pack(anchor='w')
+        ttk.Label(chart_frame, textvariable=self.chart_title, style='Note.TLabel').pack(anchor='w', pady=(1, 0))
+        self.chart_canvas = tk.Canvas(chart_frame, width=380, height=150, background='white',
                                       highlightthickness=1, highlightbackground='#DDE6EE')
         self.chart_canvas.pack(fill='both', expand=True, pady=(4, 3))
         self.chart_canvas.bind('<Configure>', self._draw_chart)
-        ttk.Label(chart_frame, textvariable=self.chart_caption, style='Note.TLabel',
-                  wraplength=260).pack(anchor='w')
+        legend = ttk.Frame(chart_frame, style='App.TFrame')
+        legend.pack(fill='x')
+        ttk.Label(legend, textvariable=self.chart_legend_usd, style='Note.TLabel',
+                  foreground='#2468B4').pack(side='left')
+        ttk.Label(legend, textvariable=self.chart_legend_eur, style='Note.TLabel',
+                  foreground='#C86A16').pack(side='left', padx=(20, 0))
+        ttk.Label(chart_frame, text='Изменение от первой общей точки, %', style='Note.TLabel',
+                  wraplength=380).pack(anchor='w', pady=(2, 0))
         self.coin_combobox.bind('<<ComboboxSelected>>', self._on_coin_selected)
         self.currency_combobox.bind('<<ComboboxSelected>>', self._on_currency_selected)
         self.root.bind('<Control-r>', lambda event: self.refresh())
 
         card_border = tk.Frame(frame, background='#DDE6EE', padx=1, pady=1)
         card_border.grid(row=2, column=0, sticky='ew')
-        card = ttk.Frame(card_border, style='Card.TFrame', padding=(20, 14))
+        card = ttk.Frame(card_border, style='Card.TFrame', padding=(20, 10))
         card.pack(fill='both', expand=True)
         card.columnconfigure(0, weight=1)
         ttk.Label(card, textvariable=self.pair_title, style='Pair.TLabel').grid(row=0, column=0, sticky='w')
@@ -561,7 +649,7 @@ class CryptoApp:
         card.bind('<Configure>', self._fit_card_price)
 
         table_header = ttk.Frame(frame, style='App.TFrame')
-        table_header.grid(row=3, column=0, sticky='ew', pady=(17, 8))
+        table_header.grid(row=3, column=0, sticky='ew', pady=(12, 6))
         ttk.Label(table_header, textvariable=self.market_title, style='Section.TLabel').pack(side='left')
         ttk.Label(table_header, text='Выберите строку для просмотра пары', style='Note.TLabel').pack(side='right')
         table_frame = ttk.Frame(frame, style='App.TFrame')
@@ -592,11 +680,13 @@ class CryptoApp:
         footer.grid(row=5, column=0, sticky='ew', pady=(11, 0))
         self.status_label = ttk.Label(footer, textvariable=self.status, style='Status.TLabel', wraplength=850)
         self.status_label.pack(anchor='w')
-        ttk.Label(footer, textvariable=self.received, style='Note.TLabel').pack(anchor='w', pady=(3, 0))
+        receipt_row = ttk.Frame(footer, style='App.TFrame')
+        receipt_row.pack(fill='x', pady=(3, 0))
+        ttk.Label(receipt_row, textvariable=self.received, style='Note.TLabel').pack(side='left')
         ttk.Label(footer, textvariable=self.price_note, style='Note.TLabel', wraplength=850).pack(anchor='w', pady=(3, 0))
-        self.fx_attribution = ttk.Label(footer, text='Rates By Exchange Rate API', foreground='#087F8C',
+        self.fx_attribution = ttk.Label(receipt_row, text='Rates By Exchange Rate API', foreground='#087F8C',
                                          cursor='hand2', style='Note.TLabel', takefocus=True)
-        self.fx_attribution.pack(anchor='w', pady=(3, 0))
+        self.fx_attribution.pack(side='right')
         open_fx = lambda event: webbrowser.open('https://www.exchangerate-api.com')
         self.fx_attribution.bind('<Button-1>', open_fx)
         self.fx_attribution.bind('<Return>', open_fx)
@@ -761,7 +851,6 @@ class CryptoApp:
 
     def _on_currency_selected(self, event=None):
         self._render_view()
-        self._schedule_chart()
 
     def _on_table_selected(self, event=None):
         selection = self.table.selection()
@@ -784,39 +873,51 @@ class CryptoApp:
         self.chart_series = None
         self.chart_pending = None
         self.chart_message = message
+        self.chart_legend_usd.set('USD —')
+        self.chart_legend_eur.set('EUR —')
         self._draw_chart()
 
-    def _history_caption(self, quote):
-        if quote.provenance == 'calculated':
-            caption = (f'Расчёт · FX от {quote.fx_date:%d.%m}' if quote.fx_date is not None
-                       else 'Расчёт через USDT/USD')
-        else:
-            caption = '24 ч · 15 мин + текущая цена'
-        if self.stale or quote.fx_stale:
-            caption += ' · устарело'
-        return caption
+    def _comparison_caption(self, comparison):
+        parts = ['История Bybit: шаг 15 минут и текущая цена.']
+        for series in comparison.histories:
+            unit = series.pair_key[1]
+            if series.fx_date is not None:
+                parts.append(f'{unit}: фиксированный FX от {series.fx_date:%d.%m}; динамика совпадает с USD.')
+            elif series.calculated:
+                parts.append(f'{unit}: расчёт через USDT/USD.')
+        for unit, error in comparison.errors:
+            reason = 'неполные данные' if 'Неполные' in error else 'история недоступна'
+            parts.append(f'{unit}: {reason}.')
+        if self.stale or any(series.fx_stale for series in comparison.histories):
+            parts.append('Данные или курс FX устарели.')
+        return ' '.join(parts)
 
     def _schedule_chart(self):
         if self.closed:
             return
-        symbol, currency = self._selected_codes()
-        self.chart_token = (symbol, currency, self.snapshot_version)
-        self.chart_title.set(f'{symbol} / {currency} · 24 часа')
+        symbol, _ = self._selected_codes()
+        token = (symbol, self.snapshot_version)
+        if token == self.chart_token and (self.chart_series is not None or self.chart_pending is not None
+                                         or self.chart_active_token == token):
+            return
+        self.chart_token = token
+        self.chart_title.set(f'{symbol} / USD / EUR · 24 часа')
         self._clear_chart()
-        quote = self._quote_for(symbol, currency)
+        quotes = tuple(quote for unit in ('USD', 'EUR')
+                       if (quote := self._quote_for(symbol, unit)) is not None)
         if self.busy:
             self.chart_token = None
             self.chart_message = 'Обновляем котировки…'
             self.chart_caption.set('История появится после обновления')
-        elif quote is None:
+        elif not quotes:
             self.chart_message = 'Нет данных'
             self.chart_caption.set('Сначала обновите котировки')
-        elif quote.status != 'available':
+        elif not any(quote.status == 'available' for quote in quotes):
             self.chart_message = 'Нет рыночной истории'
-            self.chart_caption.set('Валюта совпадает' if symbol == currency else 'Недостаточно данных для этой пары')
+            self.chart_caption.set('Недостаточно данных для USD и EUR')
         else:
-            self.chart_caption.set(self._history_caption(quote))
-            self.chart_pending = (self.chart_token, quote, self.snapshot.received_at)
+            self.chart_caption.set('Загружается история Bybit с шагом 15 минут.')
+            self.chart_pending = (self.chart_token, quotes, self.snapshot.received_at)
             self.chart_debounce_id = self.root.after(250, self._start_chart_request)
         self._draw_chart()
 
@@ -824,12 +925,12 @@ class CryptoApp:
         self.chart_debounce_id = None
         if self.closed or self.chart_busy or self.chart_pending is None:
             return
-        token, quote, snapshot_time = self.chart_pending
+        token, quotes, snapshot_time = self.chart_pending
         self.chart_pending = None
         self.chart_busy = True
         self.chart_active_token = token
-        Thread(target=fetch_history_in_worker,
-               args=(self.provider, quote, snapshot_time, self.chart_results, token),
+        Thread(target=fetch_comparison_in_worker,
+               args=(self.provider, quotes, snapshot_time, self.chart_results, token),
                daemon=True).start()
 
     def _show_chart_result(self, token, series, error):
@@ -839,11 +940,19 @@ class CryptoApp:
             self.chart_series = None
             self.chart_message = 'История недоступна'
             self.chart_caption.set('Неполные данные за 24 часа' if 'Неполные' in error else 'Повторите обновление позднее')
-        elif series is not None and series.pair_key == token[:2] and self.snapshot is not None:
+        elif isinstance(series, ComparisonHistory) and series.symbol == token[0] and self.snapshot is not None:
             if series.received_at != self.snapshot.received_at:
+                return
+            try:
+                normalized = normalize_comparison(series)
+            except QuoteError:
                 return
             self.chart_series = series
             self.chart_message = ''
+            for unit, variable in (('USD', self.chart_legend_usd), ('EUR', self.chart_legend_eur)):
+                values = normalized.get(unit)
+                variable.set(f'{unit} {format_percent(values[-1][1])}' if values else f'{unit} — нет данных')
+            self.chart_caption.set(self._comparison_caption(series))
         self._draw_chart()
 
     def _poll_chart_results(self):
@@ -865,30 +974,46 @@ class CryptoApp:
         canvas = self.chart_canvas
         canvas.delete('all')
         width, height = max(canvas.winfo_width(), 60), max(canvas.winfo_height(), 40)
-        if self.chart_series is None or len(self.chart_series.points) < 2:
+        if self.chart_series is None:
             canvas.create_text(width / 2, height / 2, text=self.chart_message,
                                fill='#617286', font=('Segoe UI', 9), width=width - 16)
             return
-        points = self.chart_series.points
+        normalized = normalize_comparison(self.chart_series)
         end = self.chart_series.received_at
         start = end - timedelta(hours=24)
-        values = [point.close for point in points]
-        minimum, maximum = min(values), max(values)
-        left, right, top, bottom = 9, width - 9, 9, height - 19
-        coordinates = []
-        for point in points:
-            fraction = (point.timestamp - start).total_seconds() / 86400
-            x = left + max(0, min(1, fraction)) * (right - left)
-            # Decimal-нормализация не теряет очень маленькие цены и не даёт infinity.
-            y_fraction = Decimal('0.5') if maximum == minimum else (point.close - minimum) / (maximum - minimum)
-            y = bottom - float(y_fraction) * (bottom - top)
-            coordinates.extend((x, y))
-        canvas.create_line(left, bottom, right, bottom, fill='#E5EDF2')
-        canvas.create_line(*coordinates, fill='#087F8C', width=2)
-        x, y = coordinates[-2:]
-        canvas.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill='#087F8C', outline='')
+        values = [change for points in normalized.values() for _, change in points]
+        minimum, maximum = min(Decimal('0'), min(values)), max(Decimal('0'), max(values))
+        padding = (maximum - minimum) * Decimal('0.12') if maximum != minimum else Decimal('1')
+        minimum, maximum = minimum - padding, maximum + padding
+        left, right, top, bottom = 57, width - 12, 10, height - 23
+        for step in range(5):
+            level = minimum + (maximum - minimum) * Decimal(step) / 4
+            y = bottom - step / 4 * (bottom - top)
+            canvas.create_line(left, y, right, y, fill='#E7EDF3')
+            canvas.create_text(left - 6, y, text=f'{level:+.3g}%', anchor='e',
+                               fill='#718397', font=('Segoe UI', 7))
+        zero_y = bottom - float(-minimum / (maximum - minimum)) * (bottom - top)
+        canvas.create_line(left, zero_y, right, zero_y, fill='#B9C7D4', dash=(3, 3))
+        overlap = ('USD' in normalized and 'EUR' in normalized
+                   and all(abs(usd[1] - eur[1]) <= Decimal('1e-20')
+                           for usd, eur in zip(normalized['USD'], normalized['EUR'])))
+        for unit, color in (('USD', '#2468B4'), ('EUR', '#C86A16')):
+            if unit not in normalized:
+                continue
+            coordinates = []
+            for moment, change in normalized[unit]:
+                fraction = (moment - start).total_seconds() / 86400
+                x = left + max(0, min(1, fraction)) * (right - left)
+                y = bottom - float((change - minimum) / (maximum - minimum)) * (bottom - top)
+                coordinates.extend((x, y))
+            options = {'fill': color, 'width': 2}
+            if unit == 'EUR' and overlap:
+                options['dash'] = (5, 4)
+            canvas.create_line(*coordinates, **options)
+            x, y = coordinates[-2:]
+            canvas.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill=color, outline='')
         canvas.create_text(left, height - 8, text='24 ч назад', anchor='w', fill='#7A8B9A', font=('Segoe UI', 7))
-        canvas.create_text(right, height - 8, text='текущая цена', anchor='e', fill='#7A8B9A', font=('Segoe UI', 7))
+        canvas.create_text(right, height - 8, text='сейчас', anchor='e', fill='#7A8B9A', font=('Segoe UI', 7))
 
     def refresh(self):
         if self.closed or self.busy:
@@ -929,7 +1054,7 @@ class CryptoApp:
         self.last_error = ''
         self.source.set(f'{snapshot.source} · прямые пары и пересчёт через USD · 12 валют')
         self.price_note.set(
-            'USD и USDT — разные валюты. Расчётные цены отмечены знаком ≈ и источником пересчёта.'
+            'Расчётные цены отмечены знаком ≈. USD и USDT — разные валюты.'
         )
         received = snapshot.received_at.astimezone(MOSCOW_TIME).strftime('%d.%m.%Y %H:%M:%S')
         self.received.set(f'Данные получены: {received} МСК')
