@@ -45,6 +45,27 @@ def ticker_payload():
     ]}}
 
 
+def metrics_payload():
+    """Оборот пары, количество монет и доля изменения заведомо различаются."""
+    payload = ticker_payload()
+    metrics = {
+        'BTCUSD': ('1000', '0.5', '-0.0125'),
+        'ETHUSD': ('2000', '8', '0.02'),
+        'USDTUSD': ('9000000', '8997300', '0.003'),
+        'BTCUSDT': ('888888', '12', '0.10'),
+        'ETHUSDT': ('777777', '11', '-0.10'),
+        'GRAMUSDT': ('6000', '9000', '-0.04'),
+        'BNBUSDT': ('2000', '5', '0.10'),
+        'SOLUSDT': ('3000', '6', '0'),
+        'XRPUSDT': ('4000', '7', '-0.02'),
+        'DOGEUSDT': ('5000', '8', '0.03'),
+    }
+    for item in payload['result']['list']:
+        turnover, volume, change = metrics[item['symbol']]
+        item.update(turnover24h=turnover, volume24h=volume, price24hPcnt=change)
+    return payload
+
+
 def by_id(payload=None):
     return {quote.row_id: quote for quote in parse_quotes(
         ticker_payload() if payload is None else payload
@@ -243,6 +264,154 @@ class ParseQuotesTests(unittest.TestCase):
         before = copy.deepcopy(payload)
         parse_quotes(payload)
         self.assertEqual(payload, before)
+
+
+class MarketMetricsTests(unittest.TestCase):
+    def quotes(self, payload=None, fx=None):
+        return {q.row_id: q for q in parse_quotes(
+            metrics_payload() if payload is None else payload, fx,
+        )}
+
+    def test_direct_pair_uses_turnover_in_money_and_signed_percentage(self):
+        quote = self.quotes()['BTC:USD']
+        self.assertEqual(quote.turnover_24h, Decimal('1000'))
+        self.assertNotEqual(quote.turnover_24h, Decimal('0.5'))
+        self.assertEqual(quote.turnover_market, 'BTCUSD')
+        self.assertEqual(quote.change_24h, Decimal('-1.25'))
+        self.assertEqual(quote.price, Decimal('60000.10'))
+
+    def test_each_asset_and_pair_keeps_its_own_turnover_without_summing_markets(self):
+        quotes = self.quotes()
+        self.assertEqual(quotes['BTC:USD'].turnover_24h, Decimal('1000'))
+        self.assertEqual(quotes['ETH:USD'].turnover_24h, Decimal('2000'))
+        self.assertEqual(quotes['BTC:USDT'].turnover_24h, Decimal('888888'))
+        self.assertEqual(quotes['BTC:USDT'].turnover_market, 'BTCUSDT')
+        self.assertEqual(quotes['ETH:USD'].turnover_market, 'ETHUSD')
+
+    def test_zero_metrics_are_values_and_not_missing_data(self):
+        payload = metrics_payload()
+        market(payload, 'BTCUSD').update(turnover24h='0', price24hPcnt='0')
+        quote = self.quotes(payload)['BTC:USD']
+        self.assertEqual(quote.turnover_24h, Decimal('0'))
+        self.assertEqual(quote.change_24h, Decimal('0'))
+        self.assertIsNotNone(quote.turnover_24h)
+        self.assertIsNotNone(quote.change_24h)
+        self.assertEqual(gui.format_change(quote.change_24h), '0.00%')
+        self.assertNotEqual(gui.format_turnover(quote.turnover_24h), '—')
+        self.assertEqual(gui.format_change(None), '—')
+        self.assertEqual(gui.format_turnover(None), '—')
+
+    def test_missing_metrics_do_not_use_volume_as_turnover_or_remove_valid_price(self):
+        payload = ticker_payload()
+        market(payload, 'BTCUSD')['volume24h'] = '123456'
+        quote = self.quotes(payload)['BTC:USD']
+        self.assertIsNone(quote.turnover_24h)
+        self.assertIsNone(quote.change_24h)
+        self.assertEqual(quote.price, Decimal('60000.10'))
+
+    def test_malformed_optional_metrics_are_isolated_from_each_other_and_prices(self):
+        invalid_common = (None, '', 'NaN', 'Infinity', '-Infinity', True, {}, [])
+        cases = (
+            ('turnover24h', 'turnover_24h', invalid_common + ('-1',)),
+            ('price24hPcnt', 'change_24h', invalid_common + ('-1', '-1.01')),
+        )
+        for field, attribute, invalid_values in cases:
+            for value in invalid_values:
+                with self.subTest(field=field, value=value):
+                    payload = metrics_payload()
+                    market(payload, 'BTCUSD')[field] = value
+                    quote = self.quotes(payload)['BTC:USD']
+                    self.assertIsNone(getattr(quote, attribute))
+                    self.assertEqual(quote.price, Decimal('60000.10'))
+                    self.assertEqual(quote.status, 'available')
+                    if field == 'turnover24h':
+                        self.assertEqual(quote.change_24h, Decimal('-1.25'))
+                    else:
+                        self.assertEqual(quote.turnover_24h, Decimal('1000'))
+
+    def test_tether_conversion_uses_real_bridge_price_and_compounds_both_returns(self):
+        quote = self.quotes()['BNB:USD']
+        self.assertEqual(quote.turnover_24h, Decimal('2000') * Decimal('1.0003'))
+        self.assertNotEqual(quote.turnover_24h, Decimal('9000000'))
+        self.assertEqual(quote.turnover_market, 'BNBUSDT')
+        self.assertEqual(quote.change_24h, Decimal('10.33'))
+        self.assertNotEqual(quote.change_24h, Decimal('10.3'))
+        self.assertEqual(quote.provenance, 'calculated')
+
+    def test_fixed_fx_rescales_turnover_but_preserves_usd_percentage(self):
+        quotes = self.quotes(fx=example_fx())
+        usd, rub, eur = (quotes[f'BNB:{currency}'] for currency in ('USD', 'RUB', 'EUR'))
+        self.assertEqual(rub.turnover_24h, usd.turnover_24h * Decimal('100'))
+        self.assertEqual(eur.turnover_24h, usd.turnover_24h * Decimal('0.9'))
+        self.assertEqual(rub.change_24h, usd.change_24h)
+        self.assertEqual(eur.change_24h, usd.change_24h)
+        self.assertEqual(rub.turnover_market, 'BNBUSDT')
+        self.assertEqual(rub.fx_date, example_fx().updated_at)
+
+    def test_direct_usd_metrics_take_priority_in_usd_and_fiat_calculations(self):
+        quotes = self.quotes(fx=example_fx())
+        self.assertEqual(quotes['BTC:USD'].turnover_24h, Decimal('1000'))
+        self.assertEqual(quotes['BTC:RUB'].turnover_24h, Decimal('100000'))
+        self.assertEqual(quotes['BTC:RUB'].turnover_market, 'BTCUSD')
+        self.assertEqual(quotes['BTC:RUB'].change_24h, Decimal('-1.25'))
+        payload = metrics_payload()
+        del market(payload, 'BTCUSD')['turnover24h']
+        del market(payload, 'BTCUSD')['price24hPcnt']
+        quotes = self.quotes(payload, example_fx())
+        self.assertIsNone(quotes['BTC:USD'].turnover_24h)
+        self.assertIsNone(quotes['BTC:RUB'].change_24h)
+        self.assertIsNone(quotes['BTC:RUB'].turnover_24h)
+
+    def test_direct_eur_metrics_override_calculated_usd_and_fx_metrics(self):
+        payload = metrics_payload()
+        payload['result']['list'].append({
+            'symbol': 'BTCEUR', 'lastPrice': '55000',
+            'lowPrice24h': '54000', 'highPrice24h': '56000',
+            'turnover24h': '700', 'volume24h': '0.123', 'price24hPcnt': '-0.02',
+        })
+        quote = self.quotes(payload, example_fx())['BTC:EUR']
+        self.assertEqual(quote.turnover_24h, Decimal('700'))
+        self.assertEqual(quote.change_24h, Decimal('-2'))
+        self.assertEqual(quote.turnover_market, 'BTCEUR')
+        self.assertEqual(quote.provenance, 'direct')
+        self.assertIsNone(quote.fx_date)
+
+    def test_missing_change_on_either_leg_does_not_fabricate_compound_return(self):
+        for symbol in ('BNBUSDT', 'USDTUSD'):
+            with self.subTest(symbol=symbol):
+                payload = metrics_payload()
+                del market(payload, symbol)['price24hPcnt']
+                quote = self.quotes(payload)['BNB:USD']
+                self.assertIsNone(quote.change_24h)
+                self.assertEqual(quote.turnover_24h, Decimal('2000.6000'))
+                self.assertIsNotNone(quote.price)
+
+    def test_bridge_turnover_is_not_needed_but_source_turnover_is_required(self):
+        payload = metrics_payload()
+        del market(payload, 'USDTUSD')['turnover24h']
+        quote = self.quotes(payload)['BNB:USD']
+        self.assertEqual(quote.turnover_24h, Decimal('2000.6000'))
+        self.assertEqual(quote.change_24h, Decimal('10.33'))
+        del market(payload, 'BNBUSDT')['turnover24h']
+        quote = self.quotes(payload)['BNB:USD']
+        self.assertIsNone(quote.turnover_24h)
+        self.assertEqual(quote.change_24h, Decimal('10.33'))
+
+    def test_identity_and_missing_quotes_have_no_market_metrics(self):
+        payload = metrics_payload()
+        payload['result']['list'] = [market(payload, 'BTCUSDT')]
+        quotes = self.quotes(payload)
+        for row_id in ('USDT:USDT', 'BTC:USD', 'ETH:EUR'):
+            with self.subTest(row_id=row_id):
+                self.assertIsNone(quotes[row_id].turnover_24h)
+                self.assertIsNone(quotes[row_id].change_24h)
+                self.assertEqual(quotes[row_id].turnover_market, '')
+
+    def test_change_format_distinguishes_increase_decrease_and_zero(self):
+        self.assertEqual(gui.format_change(Decimal('0.68')), '▲ +0.68%')
+        self.assertEqual(gui.format_change(Decimal('-1.2')), '▼ -1.20%')
+        self.assertEqual(gui.format_change(Decimal('0')), '0.00%')
+        self.assertEqual(gui.format_change(None), '—')
 
 
 class BybitClientTests(unittest.TestCase):

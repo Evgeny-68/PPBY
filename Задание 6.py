@@ -10,7 +10,7 @@
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation
 from pathlib import Path
 from queue import Empty, Queue
 from tempfile import TemporaryDirectory
@@ -72,6 +72,9 @@ class Quote:
     multiplier: Decimal = Decimal('1')
     fx_date: datetime | None = None
     fx_stale: bool = False
+    change_24h: Decimal | None = None
+    turnover_24h: Decimal | None = None
+    turnover_market: str = ''
 
     @property
     def row_id(self):
@@ -126,6 +129,47 @@ def positive_decimal(value):
     return number
 
 
+def optional_metric(value, minimum=Decimal('0'), inclusive=True):
+    """Повреждённая дополнительная метрика не отменяет корректную цену пары."""
+    if value is None or value == '':
+        return None
+    try:
+        number = Decimal(str(value))
+    except (DecimalException, ValueError):
+        return None
+    if not number.is_finite() or number < minimum or (not inclusive and number == minimum):
+        return None
+    return Decimal('0') if number == 0 else number
+
+
+def metric_product(*values):
+    if any(value is None for value in values):
+        return None
+    try:
+        product = Decimal('1')
+        for value in values:
+            product *= value
+        return product if product.is_finite() else None
+    except DecimalException:
+        return None
+
+
+def change_percent(*ratios):
+    """Bybit отдаёт долю изменения; для кросса перемножаются факторы доходности."""
+    if not ratios or any(ratio is None for ratio in ratios):
+        return None
+    try:
+        if len(ratios) == 1:
+            return metric_product(ratios[0], Decimal('100'))
+        factor = Decimal('1')
+        for ratio in ratios:
+            factor *= 1 + ratio
+        result = (factor - 1) * 100
+        return result if result.is_finite() else None
+    except DecimalException:
+        return None
+
+
 def bybit_result(data):
     if not isinstance(data, dict) or type(data.get('retCode')) is not int:
         raise QuoteError('Сервис вернул неверный формат данных.')
@@ -146,7 +190,7 @@ def parse_quotes(data, fx=None):
     result = bybit_result(data)
     allowed_pairs = {coin.symbol + unit for unit in QUOTE_CURRENCIES for coin in COINS
                      if coin.symbol != unit}
-    prices = {}
+    prices, metrics = {}, {}
     for item in result['list']:
         if not isinstance(item, dict):
             raise QuoteError('Сервис вернул неверную запись котировки.')
@@ -166,6 +210,12 @@ def parse_quotes(data, fx=None):
         if low > high:
             raise QuoteError(f'Некорректный диапазон цен пары {symbol}.')
         prices[symbol] = (price, low, high)
+        # turnover24h — денежный оборот в валюте пары; volume24h — число монет.
+        # Не заменяем отсутствующий оборот количеством монет или нулём.
+        metrics[symbol] = (
+            optional_metric(item.get('price24hPcnt'), Decimal('-1'), inclusive=False),
+            optional_metric(item.get('turnover24h')),
+        )
     if not prices:
         raise QuoteError('В ответе сервиса нет данных выбранных торговых пар.')
 
@@ -177,7 +227,9 @@ def parse_quotes(data, fx=None):
                 quote = Quote(coin.symbol, coin.name, unit, status='quote_currency')
             elif pair in prices:
                 quote = Quote(coin.symbol, coin.name, unit, *prices[pair],
-                              source_path=f'{coin.symbol}/{unit} на Bybit', markets=(pair,))
+                              source_path=f'{coin.symbol}/{unit} на Bybit', markets=(pair,),
+                              change_24h=change_percent(metrics[pair][0]),
+                              turnover_24h=metrics[pair][1], turnover_market=pair)
             else:
                 # Цена USDT/USD всегда берётся с биржи, а не приравнивается к единице.
                 usd_pair = coin.symbol + 'USD'
@@ -185,13 +237,21 @@ def parse_quotes(data, fx=None):
                 usd_price = None
                 markets = ()
                 path = ''
+                usd_change = usd_turnover = None
+                turnover_market = ''
                 if usd_pair in prices:
                     usd_price = prices[usd_pair][0]
                     markets, path = (usd_pair,), f'{coin.symbol}/USD'
+                    usd_change = change_percent(metrics[usd_pair][0])
+                    usd_turnover, turnover_market = metrics[usd_pair][1], usd_pair
                 elif tether_pair in prices and 'USDTUSD' in prices:
                     usd_price = prices[tether_pair][0] * prices['USDTUSD'][0]
                     markets = (tether_pair, 'USDTUSD')
                     path = f'{coin.symbol}/USDT × USDT/USD'
+                    usd_change = change_percent(metrics[tether_pair][0], metrics['USDTUSD'][0])
+                    # Это приблизительная оценка одного рынка по текущему курсу USDT/USD.
+                    usd_turnover = metric_product(metrics[tether_pair][1], prices['USDTUSD'][0])
+                    turnover_market = tether_pair
                 multiplier = Decimal('1') if unit == 'USD' else (
                     fx.rates.get(unit) if fx is not None and unit in FIAT_NAMES else None)
                 if usd_price is not None and multiplier is not None:
@@ -203,6 +263,9 @@ def parse_quotes(data, fx=None):
                         multiplier=multiplier,
                         fx_date=fx.updated_at if unit != 'USD' and fx is not None else None,
                         fx_stale=fx.stale if unit != 'USD' and fx is not None else False,
+                        change_24h=usd_change,
+                        turnover_24h=metric_product(usd_turnover, multiplier),
+                        turnover_market=turnover_market,
                     )
                 else:
                     quote = Quote(coin.symbol, coin.name, unit, status='missing')
@@ -395,6 +458,25 @@ def format_percent(value):
     digits = 2 if abs(value) >= Decimal('0.01') or value == 0 else (
         3 if abs(value) >= Decimal('0.001') else 4)
     return f'{value:+.{digits}f}%'
+
+
+def format_change(value):
+    if value is None:
+        return '—'
+    if value == 0:
+        return '0.00%'
+    return ('▲ ' if value > 0 else '▼ ') + format_percent(value)
+
+
+def format_turnover(value):
+    """Компактный денежный оборот; единица валюты указывается отдельно в GUI."""
+    if value is None:
+        return '—'
+    for threshold, suffix in ((Decimal('1e12'), 'трлн'), (Decimal('1e9'), 'млрд'),
+                              (Decimal('1e6'), 'млн'), (Decimal('1e3'), 'тыс.')):
+        if value >= threshold:
+            return f'{value / threshold:,.2f} {suffix}'.replace(',', ' ')
+    return format_price(value)
 
 
 def history_time_ticks(snapshot_time):
