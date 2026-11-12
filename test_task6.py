@@ -3,7 +3,7 @@
 import copy
 import importlib.util
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from queue import Queue
@@ -55,17 +55,45 @@ def market(payload, symbol):
     return next(item for item in payload['result']['list'] if item['symbol'] == symbol)
 
 
+TEST_TIME = datetime(2026, 1, 1, 12, 7, tzinfo=timezone.utc)
+
+
+def fx_payload(now=TEST_TIME):
+    return {
+        'result': 'success', 'base_code': 'USD',
+        'time_last_update_unix': int((now - timedelta(hours=1)).timestamp()),
+        'time_next_update_unix': int((now + timedelta(hours=23)).timestamp()),
+        'rates': {'USD': 1, 'EUR': '0.9', 'JPY': '150', 'GBP': '0.8',
+                  'AUD': '1.5', 'CAD': '1.4', 'CHF': '0.88', 'CNY': '7.2',
+                  'RUB': '100', 'KZT': '500', 'UZS': '13000'},
+    }
+
+
+def example_fx(now=TEST_TIME):
+    return gui.parse_fx(fx_payload(now), now)
+
+
+def history_payload(symbol='BTCUSD', now=TEST_TIME, value='10'):
+    candles = [
+        [str(int((moment - timedelta(minutes=15)).timestamp()) * 1000),
+         value, value, value, value, '0', '0']
+        for moment in reversed(gui.history_moments(now))
+    ]
+    return {'retCode': 0, 'time': int(now.timestamp() * 1000),
+            'result': {'category': 'spot', 'symbol': symbol, 'list': candles}}
+
+
 class ParseQuotesTests(unittest.TestCase):
-    def test_returns_eight_currencies_in_both_quote_units(self):
+    def test_returns_eight_assets_in_all_twelve_currencies(self):
         quotes = parse_quotes(ticker_payload())
         expected = {
             'BTC': 'Bitcoin', 'ETH': 'Ethereum', 'USDT': 'Tether',
             'GRAM': 'Gram (Toncoin)', 'BNB': 'BNB', 'SOL': 'Solana',
             'XRP': 'XRP', 'DOGE': 'Dogecoin',
         }
-        self.assertEqual(len(quotes), 16)
-        self.assertEqual(len({quote.row_id for quote in quotes}), 16)
-        for currency in ('USD', 'USDT'):
+        self.assertEqual(len(quotes), 96)
+        self.assertEqual(len({quote.row_id for quote in quotes}), 96)
+        for currency in gui.QUOTE_CURRENCIES:
             self.assertEqual(
                 {quote.symbol: quote.name for quote in quotes if quote.currency == currency},
                 expected,
@@ -82,8 +110,8 @@ class ParseQuotesTests(unittest.TestCase):
         quotes = by_id()
         self.assertEqual(quotes['GRAM:USDT'].price, Decimal('0.00234878'))
         self.assertEqual(quotes['BNB:USDT'].price, Decimal('605.45'))
-        self.assertEqual(quotes['GRAM:USD'].status, 'missing')
-        self.assertIsNone(quotes['GRAM:USD'].price)
+        self.assertEqual(quotes['GRAM:USD'].provenance, 'calculated')
+        self.assertEqual(quotes['GRAM:USD'].price, Decimal('0.00234878') * Decimal('1.0003'))
 
     def test_uses_last_trade_and_24_hour_range(self):
         quote = by_id()['BTC:USD']
@@ -100,7 +128,7 @@ class ParseQuotesTests(unittest.TestCase):
         payload = ticker_payload()
         payload['result']['list'] = [market(payload, 'BTCUSDT')]
         quotes = by_id(payload)
-        self.assertEqual(len(quotes), 16)
+        self.assertEqual(len(quotes), 96)
         self.assertEqual(quotes['BTC:USDT'].status, 'available')
         self.assertEqual(quotes['BTC:USD'].status, 'missing')
         for quote in quotes.values():
@@ -215,8 +243,10 @@ class BybitClientTests(unittest.TestCase):
         self.response.json.return_value = ticker_payload()
         self.get.return_value = self.response
 
-    def test_one_request_fetches_spot_markets_with_timeout(self):
-        BybitClient().fetch_quotes()
+    def test_one_ticker_request_with_cached_fx_uses_spot_and_timeout(self):
+        client = BybitClient()
+        client.fx_cache = example_fx(datetime.now(timezone.utc))
+        client.fetch_quotes()
         self.get.assert_called_once_with(
             'https://api.bybit.com/v5/market/tickers',
             params={'category': 'spot'}, headers={'Accept': 'application/json'}, timeout=(5, 10),
@@ -240,7 +270,7 @@ class BybitClientTests(unittest.TestCase):
         after = datetime.now(timezone.utc)
         self.assertIsInstance(snapshot, Snapshot)
         self.assertEqual(snapshot.source, 'Bybit')
-        self.assertEqual(len(snapshot.quotes), 16)
+        self.assertEqual(len(snapshot.quotes), 96)
         self.assertIsNotNone(snapshot.received_at.utcoffset())
         self.assertLessEqual(before, snapshot.received_at)
         self.assertLessEqual(snapshot.received_at, after)
@@ -277,6 +307,281 @@ class BybitClientTests(unittest.TestCase):
         self.response.json.side_effect = requests.exceptions.JSONDecodeError('invalid', '<html>', 0)
         with self.assertRaisesRegex(QuoteError, 'некорректный JSON'):
             BybitClient().fetch_quotes()
+
+
+class FxAndCalculationTests(unittest.TestCase):
+    def test_all_lesson_fiat_currencies_and_usdt_are_available(self):
+        self.assertEqual(set(gui.QUOTE_CURRENCIES), {
+            'USD', 'EUR', 'JPY', 'GBP', 'AUD', 'CAD', 'CHF', 'CNY', 'RUB', 'KZT', 'UZS', 'USDT',
+        })
+        self.assertEqual(gui.QUOTE_CURRENCIES[0], 'USD')
+
+    def test_fiat_calculation_uses_direct_usd_and_actual_tether_usd_cross(self):
+        quotes = {q.row_id: q for q in parse_quotes(ticker_payload(), example_fx())}
+        btc, bnb = quotes['BTC:RUB'], quotes['BNB:RUB']
+        self.assertEqual(btc.price, Decimal('60000.10') * 100)
+        self.assertEqual(btc.markets, ('BTCUSD',))
+        self.assertEqual(bnb.price, Decimal('605.45') * Decimal('1.0003') * 100)
+        self.assertEqual(bnb.markets, ('BNBUSDT', 'USDTUSD'))
+        for quote in (btc, bnb):
+            self.assertEqual(quote.provenance, 'calculated')
+            self.assertIsNone(quote.low_24h)
+            self.assertIsNone(quote.high_24h)
+            self.assertEqual(quote.fx_date, example_fx().updated_at)
+            self.assertIn('USD/RUB', quote.source_path)
+
+    def test_usdt_fiat_uses_real_usdt_usd_deviation(self):
+        quotes = {q.row_id: q for q in parse_quotes(ticker_payload(), example_fx())}
+        self.assertEqual(quotes['USDT:UZS'].price, Decimal('1.0003') * 13000)
+        self.assertNotEqual(quotes['USDT:UZS'].price, Decimal('13000'))
+        self.assertIsNone(quotes['USDT:USDT'].price)
+
+    def test_direct_eur_or_future_fiat_pair_overrides_calculation(self):
+        for symbol, currency in (('BTCEUR', 'EUR'), ('BNBRUB', 'RUB')):
+            with self.subTest(symbol=symbol):
+                payload = ticker_payload()
+                payload['result']['list'].append({
+                    'symbol': symbol, 'lastPrice': '123.45',
+                    'lowPrice24h': '120', 'highPrice24h': '125',
+                })
+                quotes = {q.row_id: q for q in parse_quotes(payload, example_fx())}
+                quote = quotes[f'{symbol[:-len(currency)]}:{currency}']
+                self.assertEqual(quote.price, Decimal('123.45'))
+                self.assertEqual(quote.provenance, 'direct')
+                self.assertEqual(quote.low_24h, Decimal('120'))
+                self.assertIsNone(quote.fx_date)
+
+    def test_missing_fx_rate_only_disables_corresponding_calculations(self):
+        payload = fx_payload()
+        del payload['rates']['RUB']
+        fx = gui.parse_fx(payload, TEST_TIME)
+        quotes = {q.row_id: q for q in parse_quotes(ticker_payload(), fx)}
+        self.assertEqual(quotes['BTC:RUB'].status, 'missing')
+        self.assertEqual(quotes['BTC:EUR'].status, 'available')
+        self.assertEqual(quotes['BTC:USD'].price, Decimal('60000.10'))
+        self.assertEqual(quotes['BNB:USD'].provenance, 'calculated')
+
+    def test_missing_usdt_usd_never_uses_a_constant_peg(self):
+        payload = ticker_payload()
+        payload['result']['list'] = [item for item in payload['result']['list']
+                                     if item['symbol'] != 'USDTUSD']
+        quotes = {q.row_id: q for q in parse_quotes(payload, example_fx())}
+        self.assertEqual(quotes['BNB:USD'].status, 'missing')
+        self.assertEqual(quotes['BNB:RUB'].status, 'missing')
+        self.assertEqual(quotes['BTC:RUB'].price, Decimal('6000010.00'))
+
+    def test_fx_rejects_wrong_base_or_non_unit_usd(self):
+        for field, value in (('base_code', 'EUR'), ('result', 'error')):
+            payload = fx_payload()
+            payload[field] = value
+            with self.subTest(field=field), self.assertRaises(QuoteError):
+                gui.parse_fx(payload, TEST_TIME)
+        for value in ('0.999', None, 'NaN', True):
+            payload = fx_payload()
+            payload['rates']['USD'] = value
+            with self.subTest(usd=value), self.assertRaises(QuoteError):
+                gui.parse_fx(payload, TEST_TIME)
+
+    def test_fx_rejects_invalid_fiat_numbers(self):
+        for value in ('0', '-1', 'Infinity', 'NaN', None, True):
+            payload = fx_payload()
+            payload['rates']['RUB'] = value
+            with self.subTest(value=value), self.assertRaises(QuoteError):
+                gui.parse_fx(payload, TEST_TIME)
+
+    def test_fx_dates_are_aware_and_expired_data_is_marked_stale(self):
+        payload = fx_payload(TEST_TIME - timedelta(days=2))
+        fx = gui.parse_fx(payload, TEST_TIME)
+        self.assertTrue(fx.stale)
+        self.assertIsNotNone(fx.updated_at.utcoffset())
+        quotes = {q.row_id: q for q in parse_quotes(ticker_payload(), fx)}
+        self.assertTrue(quotes['BTC:RUB'].fx_stale)
+        self.assertFalse(quotes['BTC:USD'].fx_stale)
+
+    def test_fx_rejects_future_or_implausibly_long_cache_dates(self):
+        scenarios = ((TEST_TIME + timedelta(minutes=6), TEST_TIME + timedelta(days=1)),
+                     (TEST_TIME, TEST_TIME + timedelta(days=3)),
+                     (TEST_TIME, TEST_TIME),
+                     (datetime(2000, 1, 1, tzinfo=timezone.utc), TEST_TIME))
+        for updated, next_update in scenarios:
+            payload = fx_payload()
+            payload['time_last_update_unix'] = updated.timestamp()
+            payload['time_next_update_unix'] = next_update.timestamp()
+            with self.subTest(updated=updated, next_update=next_update), self.assertRaises(QuoteError):
+                gui.parse_fx(payload, TEST_TIME)
+
+    def test_fx_cache_is_reused_until_daily_next_update(self):
+        client = BybitClient()
+        now = datetime.now(timezone.utc)
+        with patch.object(client, '_request_json', return_value=fx_payload(now)) as request:
+            first = client._get_fx()
+            second = client._get_fx()
+        self.assertEqual(first, second)
+        request.assert_called_once_with(client.fx_url)
+        self.assertFalse(second.stale)
+
+    def test_failed_fx_has_retry_backoff_and_preserves_expired_cache_as_stale(self):
+        client = BybitClient()
+        now = datetime.now(timezone.utc)
+        expired = gui.parse_fx(fx_payload(now - timedelta(days=2)), now)
+        client.fx_cache = expired
+        with patch.object(client, '_request_json', side_effect=QuoteError('Нет FX')) as request:
+            with patch.object(gui.time, 'monotonic', return_value=100):
+                first = client._get_fx()
+            with patch.object(gui.time, 'monotonic', return_value=159.9):
+                second = client._get_fx()
+            self.assertEqual(request.call_count, 1)
+            with patch.object(gui.time, 'monotonic', return_value=160):
+                client._get_fx()
+            self.assertEqual(request.call_count, 2)
+        self.assertTrue(first.stale)
+        self.assertEqual(first.updated_at, expired.updated_at)
+        self.assertEqual(first, second)
+        self.assertEqual(client.fx_error, 'Нет FX')
+
+    def test_initial_fx_failure_keeps_available_bybit_prices(self):
+        client = BybitClient()
+        with patch.object(client, '_request_json', side_effect=[ticker_payload(), QuoteError('Нет FX')]):
+            snapshot = client.fetch_quotes()
+        quotes = {q.row_id: q for q in snapshot.quotes}
+        self.assertIsNone(snapshot.fx)
+        self.assertEqual(snapshot.fx_error, 'Нет FX')
+        self.assertEqual(quotes['BTC:USD'].price, Decimal('60000.10'))
+        self.assertEqual(quotes['BTC:RUB'].status, 'missing')
+
+    def test_receipt_timestamp_is_taken_before_waiting_for_fx(self):
+        fx = example_fx()
+        class AdvancingClock(datetime):
+            current = TEST_TIME
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current
+
+        def slow_fx():
+            AdvancingClock.current = TEST_TIME + timedelta(seconds=15)
+            return fx
+
+        client = BybitClient()
+        with patch.object(client, '_request_json', return_value=ticker_payload()), \
+                patch.object(client, '_get_fx', side_effect=slow_fx), \
+                patch.object(gui, 'datetime', AdvancingClock):
+            snapshot = client.fetch_quotes()
+        self.assertEqual(snapshot.received_at, TEST_TIME)
+
+
+class HistoryTests(unittest.TestCase):
+    def test_reverse_candles_are_sorted_by_close_time(self):
+        points = gui.parse_history(history_payload(), 'BTCUSD', TEST_TIME)
+        self.assertEqual(tuple(p.timestamp for p in points), gui.history_moments(TEST_TIME))
+        self.assertTrue(all(p.close == Decimal('10') and not p.is_current for p in points))
+
+    def test_open_candle_and_points_later_than_server_time_are_excluded(self):
+        payload = history_payload()
+        boundary = gui.history_moments(TEST_TIME)[-1]
+        payload['result']['list'].insert(0, [str(int(boundary.timestamp() * 1000)), '1', '1', '1', '999'])
+        points = gui.parse_history(payload, 'BTCUSD', TEST_TIME)
+        self.assertNotIn(Decimal('999'), [p.close for p in points])
+        payload['time'] = int((boundary - timedelta(seconds=1)).timestamp() * 1000)
+        points = gui.parse_history(payload, 'BTCUSD', TEST_TIME)
+        self.assertTrue(all(p.timestamp < boundary for p in points))
+
+    def test_history_rejects_wrong_market_duplicates_and_invalid_close(self):
+        payloads = []
+        wrong = history_payload('ETHUSD')
+        payloads.append(wrong)
+        duplicate = history_payload()
+        duplicate['result']['list'].append(copy.deepcopy(duplicate['result']['list'][0]))
+        payloads.append(duplicate)
+        for value in ('NaN', 'Infinity', '0', '-1'):
+            invalid = history_payload()
+            invalid['result']['list'][0][4] = value
+            payloads.append(invalid)
+        for payload in payloads:
+            with self.subTest(payload=payload['result']['symbol']), self.assertRaises(QuoteError):
+                gui.parse_history(payload, 'BTCUSD', TEST_TIME)
+
+    def test_history_rejects_malformed_timestamp_and_server_clock(self):
+        for value in (True, '123', '1.5', None):
+            payload = history_payload()
+            payload['result']['list'][0][0] = value
+            with self.subTest(value=value), self.assertRaises(QuoteError):
+                gui.parse_history(payload, 'BTCUSD', TEST_TIME)
+        for value in (0, True, '123', float('inf')):
+            payload = history_payload()
+            payload['time'] = value
+            with self.subTest(server=value), self.assertRaises(QuoteError):
+                gui.parse_history(payload, 'BTCUSD', TEST_TIME)
+
+    def test_direct_history_has_closed_points_and_current_snapshot_endpoint(self):
+        client = BybitClient()
+        quote = by_id()['BTC:USD']
+        with patch.object(client, '_request_json', return_value=history_payload()) as request:
+            series = client.fetch_history(quote, TEST_TIME)
+        self.assertEqual(len(series.points), 97)
+        self.assertEqual(series.points[-1], gui.HistoryPoint(TEST_TIME, quote.price, True))
+        self.assertFalse(series.calculated)
+        params = request.call_args.args[1]
+        self.assertEqual((params['category'], params['symbol'], params['interval']), ('spot', 'BTCUSD', '15'))
+        self.assertLess(params['end'], int(gui.history_moments(TEST_TIME)[-1].timestamp() * 1000))
+
+    def test_cross_history_aligns_timestamps_and_applies_one_fixed_fx_rate(self):
+        client = BybitClient()
+        quote = next(q for q in parse_quotes(ticker_payload(), example_fx()) if q.row_id == 'BNB:RUB')
+        moments = gui.history_moments(TEST_TIME)
+        left = tuple(gui.HistoryPoint(moment, Decimal(index + 1)) for index, moment in enumerate(moments))
+        right = tuple(gui.HistoryPoint(moment, Decimal(index + 2)) for index, moment in reversed(list(enumerate(moments))))
+        with patch.object(client, '_market_history', side_effect=[left, right]) as request:
+            series = client.fetch_history(quote, TEST_TIME)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(series.points[0].close, Decimal('200'))
+        self.assertEqual(series.points[10].close, Decimal(11 * 12 * 100))
+        self.assertEqual(series.points[-1].close, quote.price)
+        self.assertEqual(series.fx_date, quote.fx_date)
+        self.assertTrue(series.calculated)
+
+    def test_cross_history_refuses_shifted_or_missing_timestamps(self):
+        client = BybitClient()
+        quote = by_id()['BNB:USD']
+        points = tuple(gui.HistoryPoint(moment, Decimal('10')) for moment in gui.history_moments(TEST_TIME))
+        shifted = tuple(gui.HistoryPoint(p.timestamp + timedelta(minutes=15), p.close) for p in points)
+        with patch.object(client, '_market_history', side_effect=[points, shifted]), \
+                self.assertRaisesRegex(QuoteError, 'Неполные данные'):
+            client.fetch_history(quote, TEST_TIME)
+
+    def test_incomplete_history_is_not_cached_and_next_attempt_can_recover(self):
+        client = BybitClient()
+        partial = history_payload()
+        partial['result']['list'].pop(5)
+        with patch.object(client, '_request_json', side_effect=[partial, history_payload()]) as request:
+            with self.assertRaisesRegex(QuoteError, 'Неполные данные'):
+                client.fetch_history(by_id()['BTC:USD'], TEST_TIME)
+            self.assertFalse(client.history_cache)
+            series = client.fetch_history(by_id()['BTC:USD'], TEST_TIME)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(len(series.points), 97)
+
+    def test_switching_fiat_reuses_market_history_until_cache_ttl(self):
+        client = BybitClient()
+        quotes = {q.row_id: q for q in parse_quotes(ticker_payload(), example_fx())}
+        with patch.object(client, '_request_json', return_value=history_payload()) as request:
+            with patch.object(gui.time, 'monotonic', return_value=100):
+                rub = client.fetch_history(quotes['BTC:RUB'], TEST_TIME)
+            with patch.object(gui.time, 'monotonic', return_value=159.9):
+                uzs = client.fetch_history(quotes['BTC:UZS'], TEST_TIME)
+            self.assertEqual(request.call_count, 1)
+            with patch.object(gui.time, 'monotonic', return_value=160):
+                client.fetch_history(quotes['BTC:RUB'], TEST_TIME)
+            self.assertEqual(request.call_count, 2)
+        self.assertEqual(uzs.points[0].close / rub.points[0].close, Decimal('130'))
+
+    def test_missing_and_identity_quotes_have_no_history_request(self):
+        client = BybitClient()
+        with patch.object(client, '_request_json') as request:
+            for row_id in ('BTC:RUB', 'USDT:USDT'):
+                with self.subTest(row_id=row_id), self.assertRaises(QuoteError):
+                    client.fetch_history(by_id()[row_id], TEST_TIME)
+        request.assert_not_called()
 
 
 class FakeVar:
@@ -366,6 +671,15 @@ class WorkerAndWindowTests(unittest.TestCase):
         window.root, window.results = Mock(), Queue()
         window.auto_refresh = FakeVar(False)
         window.last_request_started = None
+        window.snapshot_version = 0
+        window.chart_results = Queue()
+        window.chart_busy = False
+        window.chart_pending = window.chart_debounce_id = None
+        window.chart_token = window.chart_active_token = None
+        window.chart_series = None
+        window.chart_message = ''
+        window.chart_title, window.chart_caption = FakeVar(), FakeVar()
+        window._draw_chart, window._fit_card_price = Mock(), Mock()
         return window
 
     def snapshot(self, payload=None, received_at=None):
@@ -416,7 +730,7 @@ class WorkerAndWindowTests(unittest.TestCase):
         self.assertIs(window.snapshot, snapshot)
         self.assertEqual(window.received.get(), 'Данные получены: 01.01.2026 03:00:00 МСК')
         self.assertIn('Test Exchange', window.source.get())
-        self.assertIn('Test Exchange', window.price_note.get())
+        self.assertIn('Расчётные цены', window.price_note.get())
         self.assertFalse(window.stale)
         self.assertEqual(window.last_error, '')
 
@@ -486,11 +800,13 @@ class WorkerAndWindowTests(unittest.TestCase):
         window = self.window()
         window._show_result(self.snapshot(), None)
         window.coin_selection.set('GRAM — Gram (Toncoin)')
+        window.currency_selection.set('RUB — Российский рубль')
         window._on_coin_selected()
-        self.assertEqual(window._selected_codes(), ('GRAM', 'USD'))
+        window._on_currency_selected()
+        self.assertEqual(window._selected_codes(), ('GRAM', 'RUB'))
         self.assertNotIn('0.00234878', window.price_text.get())
-        self.assertNotIn('0.00234878', window.table.rows['GRAM:USD'])
-        self.assertIn('USDT', window.selection_hint.get())
+        self.assertNotIn('0.00234878', window.table.rows['GRAM:RUB'])
+        self.assertIn('USD', window.selection_hint.get())
         self.assert_no_network_on_selection(window)
 
     def test_identity_pair_shows_quote_currency_without_fake_one(self):
@@ -501,7 +817,8 @@ class WorkerAndWindowTests(unittest.TestCase):
         window._on_currency_selected()
         self.assertEqual(window._selected_codes(), ('USDT', 'USDT'))
         self.assertNotIn(window.price_text.get(), ('1', '1.00', '1 USDT', '1.00 USDT'))
-        self.assertIn('котиров', (window.selection_hint.get() + window.card_state.get()).lower())
+        self.assertEqual(window.price_text.get(), 'Валюта совпадает')
+        self.assertEqual(window.table.rows['USDT:USDT'][2:5], ('—', '—', '—'))
         self.assert_no_network_on_selection(window)
 
     def test_failed_refresh_preserves_visible_values_and_receipt(self):
@@ -558,7 +875,7 @@ class WorkerAndWindowTests(unittest.TestCase):
         window._show_result(self.snapshot(), None)
         payload = ticker_payload()
         payload['result']['list'] = [
-            item for item in payload['result']['list'] if item['symbol'] not in ('BTCUSD', 'ETHUSDT')
+            item for item in payload['result']['list'] if item['symbol'] not in ('BTCUSD', 'BTCUSDT', 'ETHUSDT')
         ]
         snapshot = self.snapshot(payload)
         window._show_result(snapshot, None)
@@ -633,6 +950,120 @@ class WorkerAndWindowTests(unittest.TestCase):
             window._poll()
             thread.assert_not_called()
         window.root.after.assert_not_called()
+
+    def test_calculated_card_table_and_chart_explain_fixed_fx(self):
+        window = self.window()
+        window.currency_selection.set(gui.CURRENCY_LABELS['RUB'])
+        window._show_result(Snapshot(parse_quotes(ticker_payload(), example_fx()), TEST_TIME,
+                                    fx=example_fx()), None)
+        self.assertIn('≈', window.price_text.get())
+        self.assertEqual((window.low_text.get(), window.high_text.get()), ('—', '—'))
+        self.assertEqual(window.table.rows['BTC:RUB'][3:5], ('—', '—'))
+        self.assertIn('FX от', window.selection_hint.get())
+        self.assertIn('не учитываются', window.selection_hint.get())
+        self.assertIn('Расчёт · FX от', window.chart_caption.get())
+
+    def test_initial_fx_failure_message_does_not_claim_a_cached_date(self):
+        window = self.window()
+        snapshot = Snapshot(parse_quotes(ticker_payload()), TEST_TIME, fx_error='Нет FX')
+        window._show_result(snapshot, None)
+        self.assertIn('Курсы FX недоступны', window.status.get())
+        self.assertNotIn('дата', window.status.get())
+        self.assertIn('60 000.10', window.price_text.get())
+
+    def test_expired_fx_remains_marked_stale_when_currency_changes(self):
+        window = self.window()
+        fx = gui.parse_fx(fx_payload(TEST_TIME - timedelta(days=2)), TEST_TIME)
+        window.currency_selection.set(gui.CURRENCY_LABELS['RUB'])
+        window._show_result(Snapshot(parse_quotes(ticker_payload(), fx), TEST_TIME,
+                                    fx=fx, fx_error='Нет FX'), None)
+        self.assertIn('FX устарел', window.card_state.get())
+        self.assertIn('устарело', window.chart_caption.get())
+        window.currency_selection.set(gui.CURRENCY_LABELS['UZS'])
+        window._on_currency_selected()
+        self.assertIn('FX устарел', window.card_state.get())
+        self.assertIn('устаревший FX', window.status.get())
+        self.assertIn('FX устарел', window.table.rows['BTC:UZS'][-1])
+
+    def test_selection_clears_previous_chart_and_late_response_cannot_replace_it(self):
+        window = self.window()
+        window._show_result(self.snapshot(received_at=TEST_TIME), None)
+        old_token = window.chart_token
+        old_series = gui.HistorySeries(('BTC', 'USD'), (), TEST_TIME)
+        window.chart_series = old_series
+        window.currency_selection.set(gui.CURRENCY_LABELS['USDT'])
+        window._on_currency_selected()
+        self.assertIsNone(window.chart_series)
+        window._show_chart_result(old_token, old_series, None)
+        self.assertIsNone(window.chart_series)
+        self.assertEqual(window.chart_token[:2], ('BTC', 'USDT'))
+
+    def test_chart_rejects_other_pair_and_previous_snapshot_even_with_current_token(self):
+        window = self.window()
+        window._show_result(self.snapshot(received_at=TEST_TIME), None)
+        token = window.chart_token
+        for series in (gui.HistorySeries(('ETH', 'USD'), (), TEST_TIME),
+                       gui.HistorySeries(('BTC', 'USD'), (), TEST_TIME - timedelta(seconds=60))):
+            window._show_chart_result(token, series, None)
+            self.assertIsNone(window.chart_series)
+        window._show_result(self.snapshot(received_at=TEST_TIME + timedelta(seconds=60)), None)
+        self.assertNotEqual(window.chart_token, token)
+        window._show_chart_result(token, gui.HistorySeries(('BTC', 'USD'), (), TEST_TIME), None)
+        self.assertIsNone(window.chart_series)
+
+    def test_single_history_worker_keeps_only_latest_pending_selection(self):
+        window = self.window()
+        window._show_result(self.snapshot(received_at=TEST_TIME), None)
+        with patch.object(gui, 'Thread') as thread:
+            window._start_chart_request()
+            old_token = window.chart_active_token
+            self.assertEqual(thread.call_count, 1)
+            window.coin_selection.set(gui.COIN_LABELS['ETH'])
+            window._on_coin_selected()
+            window._start_chart_request()
+            window.coin_selection.set(gui.COIN_LABELS['BNB'])
+            window._on_coin_selected()
+            window._start_chart_request()
+            self.assertEqual(thread.call_count, 1)
+            self.assertEqual(window.chart_pending[0][:2], ('BNB', 'USD'))
+            window.chart_results.put((old_token, None, 'Ошибка старой истории'))
+            window._poll_chart_results()
+            self.assertEqual(thread.call_count, 2)
+            self.assertEqual(window.chart_active_token[:2], ('BNB', 'USD'))
+            self.assertTrue(thread.call_args.kwargs['daemon'])
+
+    def test_history_failure_changes_only_chart_not_quotes_or_receipt(self):
+        window = self.window()
+        window._show_result(self.snapshot(received_at=TEST_TIME), None)
+        rows, price = copy.deepcopy(window.table.rows), window.price_text.get()
+        receipt = list(window.received.history)
+        window._show_chart_result(window.chart_token, None, 'Неполные данные истории')
+        self.assertEqual(window.table.rows, rows)
+        self.assertEqual(window.price_text.get(), price)
+        self.assertEqual(window.received.history, receipt)
+        self.assertIn('Неполные', window.chart_caption.get())
+        self.assertFalse(window.stale)
+
+    def test_history_worker_queues_unexpected_error_and_closing_rejects_response(self):
+        provider, results = Mock(), Queue()
+        provider.fetch_history.side_effect = RuntimeError('private detail')
+        token = ('BTC', 'USD', 1)
+        gui.fetch_history_in_worker(provider, by_id()['BTC:USD'], TEST_TIME, results, token)
+        result_token, series, error = results.get_nowait()
+        self.assertEqual(result_token, token)
+        self.assertIsNone(series)
+        self.assertNotIn('private detail', error)
+        window = self.window()
+        window.start_id = window.timer_id = None
+        window.chart_debounce_id = 'chart_timer'
+        window.close()
+        window.root.after_cancel.assert_called_once_with('chart_timer')
+        window._show_chart_result(token, gui.HistorySeries(('BTC', 'USD'), (), TEST_TIME), None)
+        with patch.object(gui, 'Thread') as thread:
+            window._schedule_chart()
+            window._start_chart_request()
+            thread.assert_not_called()
+        self.assertIsNone(window.chart_series)
 
 
 if __name__ == '__main__':

@@ -1,11 +1,14 @@
-"""Задание 6. Прямые котировки Bybit отдельно к USD и USDT.
+"""Задание 6. Криптовалюты в 12 валютах и график цен за 24 часа.
+
+Прямые пары берутся с Bybit; расчётные цены и графики явно отмечают путь
+пересчёта и дату суточного курса ExchangeRate-API.
 
 Запуск: python "Задание 6.py"
 Зависимость: python -m pip install requests
 Для запуска достаточно этого файла; иконка встроена в код.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -14,8 +17,10 @@ from tempfile import TemporaryDirectory
 from threading import Thread
 import base64
 import time
+import webbrowser
 import tkinter as tk
 from tkinter import ttk
+from tkinter import font as tkfont
 
 import requests
 
@@ -27,16 +32,29 @@ class Coin:
 
 
 COINS = (
-    Coin('BTC', 'Bitcoin'),
-    Coin('ETH', 'Ethereum'),
-    Coin('USDT', 'Tether'),
-    Coin('GRAM', 'Gram (Toncoin)'),
-    Coin('BNB', 'BNB'),
-    Coin('SOL', 'Solana'),
-    Coin('XRP', 'XRP'),
-    Coin('DOGE', 'Dogecoin'),
+    Coin('BTC', 'Bitcoin'), Coin('ETH', 'Ethereum'), Coin('USDT', 'Tether'),
+    Coin('GRAM', 'Gram (Toncoin)'), Coin('BNB', 'BNB'), Coin('SOL', 'Solana'),
+    Coin('XRP', 'XRP'), Coin('DOGE', 'Dogecoin'),
 )
-QUOTE_CURRENCIES = ('USD', 'USDT')
+FIAT_NAMES = {
+    'USD': 'Доллар США', 'EUR': 'Евро', 'JPY': 'Японская йена',
+    'GBP': 'Фунт стерлингов', 'AUD': 'Австралийский доллар',
+    'CAD': 'Канадский доллар', 'CHF': 'Швейцарский франк',
+    'CNY': 'Китайский юань', 'RUB': 'Российский рубль',
+    'KZT': 'Казахстанский тенге', 'UZS': 'Узбекский сум',
+}
+QUOTE_CURRENCIES = (*FIAT_NAMES, 'USDT')
+HISTORY_INTERVAL_SECONDS = 15 * 60
+FX_RETRY_SECONDS = 60
+HISTORY_CACHE_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class FxRates:
+    rates: dict[str, Decimal]
+    updated_at: datetime
+    next_update_at: datetime
+    stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -48,6 +66,12 @@ class Quote:
     low_24h: Decimal | None = None
     high_24h: Decimal | None = None
     status: str = 'available'
+    provenance: str = 'direct'
+    source_path: str = ''
+    markets: tuple[str, ...] = ()
+    multiplier: Decimal = Decimal('1')
+    fx_date: datetime | None = None
+    fx_stale: bool = False
 
     @property
     def row_id(self):
@@ -59,14 +83,32 @@ class Snapshot:
     quotes: tuple[Quote, ...]
     received_at: datetime
     source: str = 'Bybit'
+    fx: FxRates | None = None
+    fx_error: str = ''
+
+
+@dataclass(frozen=True)
+class HistoryPoint:
+    timestamp: datetime
+    close: Decimal
+    is_current: bool = False
+
+
+@dataclass(frozen=True)
+class HistorySeries:
+    pair_key: tuple[str, str]
+    points: tuple[HistoryPoint, ...]
+    received_at: datetime
+    calculated: bool = False
+    fx_date: datetime | None = None
+    fx_stale: bool = False
 
 
 class QuoteError(Exception):
-    """Понятная пользователю ошибка получения котировок."""
+    """Понятная пользователю ошибка получения рыночных данных."""
 
 
 def positive_decimal(value):
-    """Не пропускаем пустые, бесконечные, нулевые и отрицательные цены."""
     try:
         number = Decimal(str(value))
     except (InvalidOperation, ValueError):
@@ -76,8 +118,7 @@ def positive_decimal(value):
     return number
 
 
-def parse_quotes(data):
-    """Нормализуем только точные пары; отсутствующие пары не пересчитываем."""
+def bybit_result(data):
     if not isinstance(data, dict) or type(data.get('retCode')) is not int:
         raise QuoteError('Сервис вернул неверный формат данных.')
     if data['retCode'] != 0:
@@ -87,24 +128,23 @@ def parse_quotes(data):
     result = data.get('result')
     if not isinstance(result, dict) or result.get('category') != 'spot':
         raise QuoteError('Сервис вернул неверный формат спотовых котировок.')
-    items = result.get('list')
-    if not isinstance(items, list) or not items:
+    if not isinstance(result.get('list'), list) or not result['list']:
         raise QuoteError('Сервис вернул пустой или неверный список котировок.')
+    return result
 
-    allowed_pairs = {
-        coin.symbol + currency
-        for currency in QUOTE_CURRENCIES
-        for coin in COINS
-        if coin.symbol != currency
-    }
+
+def parse_quotes(data, fx=None):
+    """Прямые рынки имеют приоритет; расчётные цены явно хранят путь пересчёта."""
+    result = bybit_result(data)
+    allowed_pairs = {coin.symbol + unit for unit in QUOTE_CURRENCIES for coin in COINS
+                     if coin.symbol != unit}
     prices = {}
-    for item in items:
+    for item in result['list']:
         if not isinstance(item, dict):
             raise QuoteError('Сервис вернул неверную запись котировки.')
         symbol = item.get('symbol')
         if not isinstance(symbol, str) or not symbol:
             raise QuoteError('Сервис не указал символ торговой пары.')
-        # Например, BTCUSDT и BTCUSD — разные рынки. Совпадения по суффиксу нет.
         if symbol not in allowed_pairs:
             continue
         if symbol in prices:
@@ -118,38 +158,137 @@ def parse_quotes(data):
         if low > high:
             raise QuoteError(f'Некорректный диапазон цен пары {symbol}.')
         prices[symbol] = (price, low, high)
-
     if not prices:
         raise QuoteError('В ответе сервиса нет данных выбранных торговых пар.')
 
     quotes = []
-    for currency in QUOTE_CURRENCIES:
+    for unit in QUOTE_CURRENCIES:
         for coin in COINS:
-            pair = coin.symbol + currency
-            if coin.symbol == currency:
-                # USDT/USDT не является рыночным курсом и не показывается как 1.
-                quote = Quote(coin.symbol, coin.name, currency, status='quote_currency')
-            elif pair not in prices:
-                quote = Quote(coin.symbol, coin.name, currency, status='missing')
+            pair = coin.symbol + unit
+            if coin.symbol == unit:
+                quote = Quote(coin.symbol, coin.name, unit, status='quote_currency')
+            elif pair in prices:
+                quote = Quote(coin.symbol, coin.name, unit, *prices[pair],
+                              source_path=f'{coin.symbol}/{unit} на Bybit', markets=(pair,))
             else:
-                quote = Quote(coin.symbol, coin.name, currency, *prices[pair])
+                # Цена USDT/USD всегда берётся с биржи, а не приравнивается к единице.
+                usd_pair = coin.symbol + 'USD'
+                tether_pair = coin.symbol + 'USDT'
+                usd_price = None
+                markets = ()
+                path = ''
+                if usd_pair in prices:
+                    usd_price = prices[usd_pair][0]
+                    markets, path = (usd_pair,), f'{coin.symbol}/USD'
+                elif tether_pair in prices and 'USDTUSD' in prices:
+                    usd_price = prices[tether_pair][0] * prices['USDTUSD'][0]
+                    markets = (tether_pair, 'USDTUSD')
+                    path = f'{coin.symbol}/USDT × USDT/USD'
+                multiplier = Decimal('1') if unit == 'USD' else (
+                    fx.rates.get(unit) if fx is not None and unit in FIAT_NAMES else None)
+                if usd_price is not None and multiplier is not None:
+                    if unit != 'USD':
+                        path += f' × USD/{unit}'
+                    quote = Quote(
+                        coin.symbol, coin.name, unit, usd_price * multiplier,
+                        provenance='calculated', source_path=path, markets=markets,
+                        multiplier=multiplier,
+                        fx_date=fx.updated_at if unit != 'USD' and fx is not None else None,
+                        fx_stale=fx.stale if unit != 'USD' and fx is not None else False,
+                    )
+                else:
+                    quote = Quote(coin.symbol, coin.name, unit, status='missing')
             quotes.append(quote)
     return tuple(quotes)
 
 
+def parse_fx(data, now=None):
+    """Суточный FX: пропущенная валюта не отменяет остальные корректные курсы."""
+    if not isinstance(data, dict) or data.get('result') != 'success' or data.get('base_code') != 'USD':
+        raise QuoteError('Некорректный ответ сервиса валютных курсов.')
+    rates = data.get('rates')
+    if not isinstance(rates, dict) or positive_decimal(rates.get('USD')) != Decimal('1'):
+        raise QuoteError('Некорректная базовая валюта FX.')
+    now = datetime.now(timezone.utc) if now is None else now
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise QuoteError('Некорректное время проверки FX.')
+    try:
+        last_value, next_value = data['time_last_update_unix'], data['time_next_update_unix']
+        if type(last_value) not in (int, float) or type(next_value) not in (int, float):
+            raise ValueError
+        updated = datetime.fromtimestamp(last_value, timezone.utc)
+        next_update = datetime.fromtimestamp(next_value, timezone.utc)
+        if (updated.year < 2009 or updated > now + timedelta(minutes=5)
+                or next_update <= updated or next_update - updated > timedelta(days=2)):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        raise QuoteError('Некорректные даты обновления FX.') from None
+    normalized = {unit: positive_decimal(rates[unit]) for unit in FIAT_NAMES if unit in rates}
+    return FxRates(normalized, updated, next_update, now >= next_update)
+
+
+def parse_history(data, market, snapshot_time):
+    """Только закрытые свечи: timestamp точки — конец, а не начало 15 минут."""
+    result = bybit_result(data)
+    if result.get('symbol') != market:
+        raise QuoteError('Сервис вернул историю другой торговой пары.')
+    try:
+        server_ms = data['time']
+        if type(server_ms) not in (int, float) or server_ms <= 0:
+            raise ValueError
+        server_time = datetime.fromtimestamp(server_ms / 1000, timezone.utc)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        raise QuoteError('Сервис не указал корректное время истории.') from None
+    cutoff = snapshot_time - timedelta(hours=24)
+    limit = min(snapshot_time, server_time)
+    points = {}
+    seen = set()
+    for candle in result['list']:
+        try:
+            if not isinstance(candle, list) or len(candle) < 5 or isinstance(candle[0], bool):
+                raise ValueError
+            start_ms = int(candle[0])
+            if str(start_ms) != str(candle[0]) or start_ms < 0 or start_ms % 900000:
+                raise ValueError
+            if start_ms in seen:
+                raise QuoteError('Повторяющиеся моменты времени в истории.')
+            seen.add(start_ms)
+            closed_at = datetime.fromtimestamp(start_ms / 1000 + HISTORY_INTERVAL_SECONDS, timezone.utc)
+            close = positive_decimal(candle[4])
+        except (TypeError, ValueError, OverflowError, OSError):
+            raise QuoteError('Некорректные свечи в истории.') from None
+        if cutoff <= closed_at <= limit:
+            points[closed_at] = HistoryPoint(closed_at, close)
+    return tuple(points[key] for key in sorted(points))
+
+
+def history_moments(snapshot_time):
+    """Ожидаемая сетка закрытий свечей за последние 24 часа."""
+    end = int(snapshot_time.timestamp()) // HISTORY_INTERVAL_SECONDS * HISTORY_INTERVAL_SECONDS
+    cutoff = snapshot_time - timedelta(hours=24)
+    first = int(cutoff.timestamp()) // HISTORY_INTERVAL_SECONDS * HISTORY_INTERVAL_SECONDS
+    if datetime.fromtimestamp(first, timezone.utc) < cutoff:
+        first += HISTORY_INTERVAL_SECONDS
+    return tuple(datetime.fromtimestamp(value, timezone.utc)
+                 for value in range(first, end + 1, HISTORY_INTERVAL_SECONDS))
+
+
 class BybitClient:
-    """Адаптер источника: другой API может реализовать тот же fetch_quotes()."""
+    """Котировки, суточный FX-кэш и кэш закрытых рыночных свечей."""
 
     url = 'https://api.bybit.com/v5/market/tickers'
+    fx_url = 'https://open.er-api.com/v6/latest/USD'
+    history_url = 'https://api.bybit.com/v5/market/kline'
 
-    def fetch_quotes(self):
+    def __init__(self):
+        self.fx_cache = None
+        self.fx_retry_after = 0.0
+        self.fx_error = ''
+        self.history_cache = {}
+
+    def _request_json(self, url, params=None):
         try:
-            response = requests.get(
-                self.url,
-                params={'category': 'spot'},
-                headers={'Accept': 'application/json'},
-                timeout=(5, 10),
-            )
+            response = requests.get(url, params=params, headers={'Accept': 'application/json'}, timeout=(5, 10))
             response.raise_for_status()
         except requests.Timeout:
             raise QuoteError('Сервис не ответил вовремя. Повторите попытку.') from None
@@ -159,21 +298,81 @@ class BybitClient:
             raise QuoteError('Сервис временно недоступен. Повторите попытку позднее.') from None
         except requests.RequestException:
             raise QuoteError('Не удалось подключиться. Проверьте интернет.') from None
-
         try:
-            data = response.json()
+            return response.json()
         except ValueError:
             raise QuoteError('Сервис вернул некорректный JSON.') from None
-        quotes = parse_quotes(data)
-        # Это время получения ответа, а не время последней сделки на бирже.
-        return Snapshot(quotes, datetime.now(timezone.utc))
+
+    def _get_fx(self):
+        now = datetime.now(timezone.utc)
+        if self.fx_cache is not None and self.fx_cache.next_update_at > now:
+            self.fx_error = ''
+            return replace(self.fx_cache, stale=False)
+        if time.monotonic() >= self.fx_retry_after:
+            try:
+                self.fx_cache = parse_fx(self._request_json(self.fx_url), now)
+                self.fx_error = 'Сервис FX вернул устаревший курс.' if self.fx_cache.stale else ''
+            except QuoteError as error:
+                self.fx_error = str(error)
+            self.fx_retry_after = time.monotonic() + FX_RETRY_SECONDS
+        if self.fx_cache is None:
+            return None
+        return replace(self.fx_cache, stale=now >= self.fx_cache.next_update_at)
+
+    def fetch_quotes(self):
+        data = self._request_json(self.url, {'category': 'spot'})
+        received_at = datetime.now(timezone.utc)
+        parse_quotes(data)  # Не запрашиваем FX при повреждённом ответе биржи.
+        fx = self._get_fx()
+        return Snapshot(parse_quotes(data, fx), received_at, fx=fx, fx_error=self.fx_error)
+
+    def _market_history(self, market, snapshot_time):
+        boundary = int(snapshot_time.timestamp()) // HISTORY_INTERVAL_SECONDS * HISTORY_INTERVAL_SECONDS
+        key = (market, boundary)
+        cached = self.history_cache.get(key)
+        if cached is not None and time.monotonic() - cached[0] < HISTORY_CACHE_SECONDS:
+            return cached[1]
+        data = self._request_json(self.history_url, {
+            'category': 'spot', 'symbol': market, 'interval': '15', 'limit': 100,
+            'start': (boundary - 86400 - HISTORY_INTERVAL_SECONDS) * 1000,
+            'end': boundary * 1000 - 1,
+        })
+        points = parse_history(data, market, snapshot_time)
+        actual = {point.timestamp for point in points}
+        if any(moment not in actual for moment in history_moments(snapshot_time)):
+            raise QuoteError('Неполные данные истории за 24 часа. Попробуйте позднее.')
+        self.history_cache[key] = (time.monotonic(), points)
+        # Ограничиваем память при длительной работе и смене 15-минутных интервалов.
+        if len(self.history_cache) > 64:
+            oldest = min(self.history_cache, key=lambda item: self.history_cache[item][0])
+            del self.history_cache[oldest]
+        return points
+
+    def fetch_history(self, quote, snapshot_time):
+        if quote.status != 'available' or not quote.markets or quote.price is None:
+            raise QuoteError('Для этой пары нет истории торгов.')
+        histories = [self._market_history(market, snapshot_time) for market in quote.markets]
+        aligned = {point.timestamp: point.close for point in histories[0]}
+        for history in histories[1:]:
+            other = {point.timestamp: point.close for point in history}
+            aligned = {moment: close * other[moment] for moment, close in aligned.items() if moment in other}
+        expected = history_moments(snapshot_time)
+        if len(expected) < 2 or any(moment not in aligned for moment in expected):
+            raise QuoteError('Неполные данные истории за 24 часа. Попробуйте позднее.')
+        points = [HistoryPoint(moment, aligned[moment] * quote.multiplier) for moment in expected
+                  if moment < snapshot_time]
+        # Последняя точка — отдельное текущее наблюдение, а не незакрытая свеча.
+        points.append(HistoryPoint(snapshot_time, quote.price, is_current=True))
+        return HistorySeries((quote.symbol, quote.currency), tuple(points), snapshot_time,
+                             quote.provenance == 'calculated', quote.fx_date, quote.fx_stale)
 
 
 AUTO_REFRESH_SECONDS = 60
 MIN_REQUEST_INTERVAL = 5
 MOSCOW_TIME = timezone(timedelta(hours=3))
 COIN_LABELS = {coin.symbol: f'{coin.symbol} — {coin.name}' for coin in COINS}
-CURRENCY_LABELS = {'USD': 'USD — доллар США', 'USDT': 'USDT — Tether'}
+CURRENCY_LABELS = {code: f'{code} — {name}' for code, name in FIAT_NAMES.items()}
+CURRENCY_LABELS['USDT'] = 'USDT — Tether'
 
 
 def format_price(value: Decimal):
@@ -194,6 +393,19 @@ def fetch_in_worker(provider, results):
         results.put((None, 'Не удалось обработать ответ сервиса. Повторите попытку.'))
 
 
+def fetch_history_in_worker(provider, quote, snapshot_time, results, token):
+    """История тоже загружается без обращений рабочего потока к Tk/Canvas."""
+    try:
+        series = provider.fetch_history(quote, snapshot_time)
+        if not isinstance(series, HistorySeries):
+            raise QuoteError('Сервис вернул неверный формат истории.')
+        results.put((token, series, None))
+    except QuoteError as error:
+        results.put((token, None, str(error)))
+    except Exception:
+        results.put((token, None, 'Не удалось получить историю торгов.'))
+
+
 class CryptoApp:
     def __init__(self, root, provider=None):
         self.root = root
@@ -203,20 +415,29 @@ class CryptoApp:
         self.closed = False
         self.last_request_started = None
         self.snapshot = None
+        self.snapshot_version = 0
         self.stale = False
         self.last_error = ''
         self.displayed_currency = None
         self.timer_id = None
         self.start_id = None
+        self.chart_results = Queue()
+        self.chart_busy = False
+        self.chart_pending = None
+        self.chart_debounce_id = None
+        self.chart_token = None
+        self.chart_active_token = None
+        self.chart_series = None
+        self.chart_message = 'После загрузки данных'
 
         self.auto_refresh = tk.BooleanVar(value=False)
         self.coin_selection = tk.StringVar(value=COIN_LABELS['BTC'])
         self.currency_selection = tk.StringVar(value=CURRENCY_LABELS['USD'])
         self.status = tk.StringVar(value='Ожидание первого запроса…')
         self.received = tk.StringVar(value='Данные ещё не получены')
-        self.source = tk.StringVar(value='Источник: Bybit  •  Прямые спотовые пары')
+        self.source = tk.StringVar(value='Bybit · прямые пары и пересчёт через USD · 12 валют')
         self.price_note = tk.StringVar(
-            value='Прямые спотовые пары Bybit. USD и USDT не приравниваются друг к другу.'
+            value='USD и USDT — разные валюты. Расчётные цены отмечены знаком ≈ и источником пересчёта.'
         )
         self.pair_title = tk.StringVar()
         self.price_text = tk.StringVar()
@@ -225,9 +446,11 @@ class CryptoApp:
         self.selection_hint = tk.StringVar()
         self.card_state = tk.StringVar(value='Ожидание данных')
         self.market_title = tk.StringVar()
+        self.chart_title = tk.StringVar(value='BTC / USD · 24 часа')
+        self.chart_caption = tk.StringVar(value='История биржевых цен')
         self.root.title('Задание 6 — Курсы криптовалют')
         set_window_icon(self.root)
-        self.root.geometry('1000x760')
+        self.root.geometry('1000x820')
         self.root.minsize(920, 700)
         self.root.configure(background='#F3F6FA')
         self.root.protocol('WM_DELETE_WINDOW', self.close)
@@ -281,7 +504,7 @@ class CryptoApp:
         controls.columnconfigure(0, weight=1)
         controls.columnconfigure(1, weight=1)
         ttk.Label(controls, text='Криптовалюта', style='Field.TLabel').grid(row=0, column=0, sticky='w', pady=(0, 5))
-        ttk.Label(controls, text='Валюта котировки', style='Field.TLabel').grid(row=0, column=1, sticky='w', padx=(16, 0), pady=(0, 5))
+        ttk.Label(controls, text='Валюта', style='Field.TLabel').grid(row=0, column=1, sticky='w', padx=(16, 0), pady=(0, 5))
         self.coin_combobox = ttk.Combobox(
             controls, textvariable=self.coin_selection, values=list(COIN_LABELS.values()),
             state='readonly', width=27, takefocus=True,
@@ -289,15 +512,25 @@ class CryptoApp:
         self.coin_combobox.grid(row=1, column=0, sticky='ew')
         self.currency_combobox = ttk.Combobox(
             controls, textvariable=self.currency_selection, values=list(CURRENCY_LABELS.values()),
-            state='readonly', width=26, takefocus=True,
+            state='readonly', width=26, height=12, takefocus=True,
         )
         self.currency_combobox.grid(row=1, column=1, sticky='ew', padx=(16, 16))
-        self.refresh_button = ttk.Button(controls, text='Обновить', style='Accent.TButton', command=self.refresh)
-        self.refresh_button.grid(row=1, column=2, sticky='e')
+        actions = ttk.Frame(controls, style='App.TFrame')
+        actions.grid(row=2, column=0, columnspan=2, sticky='w', pady=(12, 0))
+        self.refresh_button = ttk.Button(actions, text='Обновить', style='Accent.TButton', command=self.refresh)
+        self.refresh_button.pack(side='left')
         ttk.Checkbutton(
-            controls, text='Обновлять каждые 60 секунд', variable=self.auto_refresh,
-        ).grid(row=2, column=0, columnspan=2, sticky='w', pady=(8, 0))
-        ttk.Label(controls, text='Ctrl+R — обновить', style='Note.TLabel').grid(row=2, column=2, sticky='e', pady=(8, 0))
+            actions, text='Обновлять каждые 60 секунд', variable=self.auto_refresh,
+        ).pack(side='left', padx=(12, 0))
+        chart_frame = ttk.Frame(controls, style='App.TFrame')
+        chart_frame.grid(row=0, column=2, rowspan=3, sticky='nsew')
+        ttk.Label(chart_frame, textvariable=self.chart_title, style='Field.TLabel').pack(anchor='w')
+        self.chart_canvas = tk.Canvas(chart_frame, width=260, height=76, background='white',
+                                      highlightthickness=1, highlightbackground='#DDE6EE')
+        self.chart_canvas.pack(fill='both', expand=True, pady=(4, 3))
+        self.chart_canvas.bind('<Configure>', self._draw_chart)
+        ttk.Label(chart_frame, textvariable=self.chart_caption, style='Note.TLabel',
+                  wraplength=260).pack(anchor='w')
         self.coin_combobox.bind('<<ComboboxSelected>>', self._on_coin_selected)
         self.currency_combobox.bind('<<ComboboxSelected>>', self._on_currency_selected)
         self.root.bind('<Control-r>', lambda event: self.refresh())
@@ -321,6 +554,11 @@ class CryptoApp:
             ttk.Label(metric, textvariable=variable, style='Metric.TLabel').pack(anchor='e', pady=(4, 0))
         self.hint_label = ttk.Label(card, textvariable=self.selection_hint, style='CardNote.TLabel', wraplength=820)
         self.hint_label.grid(row=2, column=0, columnspan=3, sticky='w', pady=(4, 0))
+        self._price_fonts = {size: tkfont.Font(root=self.root, family='Segoe UI', size=size, weight='bold')
+                             for size in range(14, 28)}
+        self._metric_font = tkfont.Font(root=self.root, family='Segoe UI', size=15, weight='bold')
+        self._metric_title_font = tkfont.Font(root=self.root, family='Segoe UI', size=9)
+        card.bind('<Configure>', self._fit_card_price)
 
         table_header = ttk.Frame(frame, style='App.TFrame')
         table_header.grid(row=3, column=0, sticky='ew', pady=(17, 8))
@@ -356,6 +594,12 @@ class CryptoApp:
         self.status_label.pack(anchor='w')
         ttk.Label(footer, textvariable=self.received, style='Note.TLabel').pack(anchor='w', pady=(3, 0))
         ttk.Label(footer, textvariable=self.price_note, style='Note.TLabel', wraplength=850).pack(anchor='w', pady=(3, 0))
+        self.fx_attribution = ttk.Label(footer, text='Rates By Exchange Rate API', foreground='#087F8C',
+                                         cursor='hand2', style='Note.TLabel', takefocus=True)
+        self.fx_attribution.pack(anchor='w', pady=(3, 0))
+        open_fx = lambda event: webbrowser.open('https://www.exchangerate-api.com')
+        self.fx_attribution.bind('<Button-1>', open_fx)
+        self.fx_attribution.bind('<Return>', open_fx)
         self.coin_combobox.focus_set()
 
     def _selected_codes(self):
@@ -368,6 +612,20 @@ class CryptoApp:
         return next((quote for quote in self.snapshot.quotes
                      if quote.symbol == symbol and quote.currency == currency), None)
 
+    def _fit_card_price(self, event=None):
+        if self.closed:
+            return
+        width = self.price_label.master.winfo_width()
+        if width < 2:
+            width = self.root.winfo_width() - 50
+        metrics = sum(max(self._metric_title_font.measure(title), self._metric_font.measure(value)) + 20
+                      for title, value in (('Минимум за 24 ч', self.low_text.get()),
+                                           ('Максимум за 24 ч', self.high_text.get())))
+        available = max(200, width - 54 - metrics)
+        size = next((size for size in range(27, 13, -1)
+                     if self._price_fonts[size].measure(self.price_text.get()) <= available), 14)
+        self.price_label.configure(font=self._price_fonts[size])
+
     def _render_card(self):
         symbol, currency = self._selected_codes()
         coin = next(coin for coin in COINS if coin.symbol == symbol)
@@ -376,13 +634,22 @@ class CryptoApp:
         self.low_text.set('—')
         self.high_text.set('—')
         if symbol == currency:
-            self.price_text.set('Валюта котировки')
-            self.selection_hint.set(f'{symbol} выбран как валюта котировки. Рыночная цена пары {symbol}/{currency} не выводится.')
+            self.price_text.set('Валюта совпадает')
+            self.selection_hint.set(f'Выбран {symbol} к самому себе. Рыночная цена пары {symbol}/{currency} не выводится.')
         elif quote is not None and quote.status == 'available':
-            self.price_text.set(f'1 {symbol} = {format_price(quote.price)} {currency}')
-            self.low_text.set(f'{format_price(quote.low_24h)} {currency}')
-            self.high_text.set(f'{format_price(quote.high_24h)} {currency}')
-            self.selection_hint.set('Цена последней сделки и диапазон за 24 часа. Время получения указано ниже.')
+            sign = '≈' if quote.provenance == 'calculated' else '='
+            self.price_text.set(f'1 {symbol} {sign} {format_price(quote.price)} {currency}')
+            if quote.low_24h is not None and quote.high_24h is not None:
+                self.low_text.set(f'{format_price(quote.low_24h)} {currency}')
+                self.high_text.set(f'{format_price(quote.high_24h)} {currency}')
+            if quote.provenance == 'calculated':
+                details = f'Расчёт: {quote.source_path}. '
+                if quote.fx_date is not None:
+                    details += f'FX от {quote.fx_date:%d.%m.%Y}; изменения валютного курса за период не учитываются. '
+                details += 'Минимум и максимум доступны только для прямой пары.'
+                self.selection_hint.set(details)
+            else:
+                self.selection_hint.set(f'Прямая пара {symbol}/{currency} на {self.snapshot.source}: последняя сделка и диапазон за 24 часа.')
         elif self.snapshot is None:
             self.price_text.set(f'1 {symbol} = — {currency}')
             self.selection_hint.set('Котировка появится после получения данных от биржи.')
@@ -392,18 +659,23 @@ class CryptoApp:
                                 and (other := self._quote_for(symbol, unit)) is not None
                                 and other.status == 'available'), None)
             if alternative:
-                self.selection_hint.set(f'В полученном ответе есть пара {symbol}/{alternative}. Выберите {alternative} в поле валюты котировки; пересчёт не выполняется.')
+                self.selection_hint.set(f'Для выбранной пары недостаточно данных. Доступен {symbol}/{alternative}; при необходимости выберите {alternative} в поле «Валюта».')
             else:
-                self.selection_hint.set('В полученном ответе нет прямой котировки этой пары. Пересчёт через другую валюту не выполняется.')
+                self.selection_hint.set('Нет прямой пары или данных, необходимых для проверенного пересчёта.')
         if self.stale and self.snapshot is not None:
             self.card_state.set('Данные устарели')
+        elif quote is not None and quote.fx_stale:
+            self.card_state.set('Курс FX устарел')
         elif self.busy:
             self.card_state.set('Обновление · прежние данные' if self.snapshot is not None else 'Загрузка…')
         elif self.last_error:
             self.card_state.set('Данные не получены')
         else:
-            self.card_state.set('Получено от биржи' if self.snapshot is not None else 'Ожидание данных')
-        self.state_label.configure(style='CardWarning.TLabel' if self.stale or self.last_error else 'CardState.TLabel')
+            self.card_state.set(('Расчётная цена' if quote is not None and quote.provenance == 'calculated'
+                                 else 'Получено от биржи') if self.snapshot is not None else 'Ожидание данных')
+        warning = self.stale or self.last_error or (quote is not None and quote.fx_stale)
+        self.state_label.configure(style='CardWarning.TLabel' if warning else 'CardState.TLabel')
+        self._fit_card_price()
 
     def _select_table_row(self):
         symbol, currency = self._selected_codes()
@@ -427,10 +699,15 @@ class CryptoApp:
             quote = self._quote_for(coin.symbol, currency)
             price = low = high = '—'
             if coin.symbol == currency:
-                availability = 'Валюта котировки'
+                availability = 'Валюта совпадает'
             elif quote is not None and quote.status == 'available':
-                price, low, high = (format_price(quote.price), format_price(quote.low_24h), format_price(quote.high_24h))
-                availability = 'Есть котировка'
+                price = format_price(quote.price)
+                if quote.provenance == 'calculated':
+                    price = '≈ ' + price
+                    availability = 'Расчёт · FX устарел' if quote.fx_stale else 'Расчёт'
+                else:
+                    low, high = format_price(quote.low_24h), format_price(quote.high_24h)
+                    availability = 'Прямая пара'
             else:
                 availability = 'Ожидание' if self.snapshot is None else 'Нет данных'
             values = (coin.name, coin.symbol, price, low, high, availability)
@@ -458,7 +735,14 @@ class CryptoApp:
             _, currency = self._selected_codes()
             available = sum(quote.status == 'available' and quote.currency == currency
                             for quote in self.snapshot.quotes)
-            message = f'Доступно прямых котировок к {currency}: {available}.'
+            calculated = sum(quote.status == 'available' and quote.currency == currency
+                             and quote.provenance == 'calculated' for quote in self.snapshot.quotes)
+            message = f'Курсы к {currency}: {available}; из них расчётных: {calculated}.'
+            if self.snapshot.fx_error:
+                if self.snapshot.fx is None:
+                    message += ' Курсы FX недоступны. Доступные биржевые пары показаны.'
+                else:
+                    message += ' Используется устаревший FX; его дата указана у расчётной цены.'
         else:
             message = 'Ожидание первого запроса…'
         self.status.set(message)
@@ -473,9 +757,11 @@ class CryptoApp:
         self._render_card()
         self._select_table_row()
         self._update_status()
+        self._schedule_chart()
 
     def _on_currency_selected(self, event=None):
         self._render_view()
+        self._schedule_chart()
 
     def _on_table_selected(self, event=None):
         selection = self.table.selection()
@@ -489,6 +775,120 @@ class CryptoApp:
             self.coin_selection.set(COIN_LABELS[symbol])
             self._render_card()
             self._update_status()
+            self._schedule_chart()
+
+    def _clear_chart(self, message='Загрузка истории…'):
+        if self.chart_debounce_id is not None:
+            self.root.after_cancel(self.chart_debounce_id)
+            self.chart_debounce_id = None
+        self.chart_series = None
+        self.chart_pending = None
+        self.chart_message = message
+        self._draw_chart()
+
+    def _history_caption(self, quote):
+        if quote.provenance == 'calculated':
+            caption = (f'Расчёт · FX от {quote.fx_date:%d.%m}' if quote.fx_date is not None
+                       else 'Расчёт через USDT/USD')
+        else:
+            caption = '24 ч · 15 мин + текущая цена'
+        if self.stale or quote.fx_stale:
+            caption += ' · устарело'
+        return caption
+
+    def _schedule_chart(self):
+        if self.closed:
+            return
+        symbol, currency = self._selected_codes()
+        self.chart_token = (symbol, currency, self.snapshot_version)
+        self.chart_title.set(f'{symbol} / {currency} · 24 часа')
+        self._clear_chart()
+        quote = self._quote_for(symbol, currency)
+        if self.busy:
+            self.chart_token = None
+            self.chart_message = 'Обновляем котировки…'
+            self.chart_caption.set('История появится после обновления')
+        elif quote is None:
+            self.chart_message = 'Нет данных'
+            self.chart_caption.set('Сначала обновите котировки')
+        elif quote.status != 'available':
+            self.chart_message = 'Нет рыночной истории'
+            self.chart_caption.set('Валюта совпадает' if symbol == currency else 'Недостаточно данных для этой пары')
+        else:
+            self.chart_caption.set(self._history_caption(quote))
+            self.chart_pending = (self.chart_token, quote, self.snapshot.received_at)
+            self.chart_debounce_id = self.root.after(250, self._start_chart_request)
+        self._draw_chart()
+
+    def _start_chart_request(self):
+        self.chart_debounce_id = None
+        if self.closed or self.chart_busy or self.chart_pending is None:
+            return
+        token, quote, snapshot_time = self.chart_pending
+        self.chart_pending = None
+        self.chart_busy = True
+        self.chart_active_token = token
+        Thread(target=fetch_history_in_worker,
+               args=(self.provider, quote, snapshot_time, self.chart_results, token),
+               daemon=True).start()
+
+    def _show_chart_result(self, token, series, error):
+        if self.closed or token != self.chart_token:
+            return
+        if error:
+            self.chart_series = None
+            self.chart_message = 'История недоступна'
+            self.chart_caption.set('Неполные данные за 24 часа' if 'Неполные' in error else 'Повторите обновление позднее')
+        elif series is not None and series.pair_key == token[:2] and self.snapshot is not None:
+            if series.received_at != self.snapshot.received_at:
+                return
+            self.chart_series = series
+            self.chart_message = ''
+        self._draw_chart()
+
+    def _poll_chart_results(self):
+        while True:
+            try:
+                token, series, error = self.chart_results.get_nowait()
+            except Empty:
+                break
+            if token == self.chart_active_token:
+                self.chart_busy = False
+                self.chart_active_token = None
+            self._show_chart_result(token, series, error)
+        if not self.chart_busy and self.chart_pending is not None and self.chart_debounce_id is None:
+            self._start_chart_request()
+
+    def _draw_chart(self, event=None):
+        if self.closed:
+            return
+        canvas = self.chart_canvas
+        canvas.delete('all')
+        width, height = max(canvas.winfo_width(), 60), max(canvas.winfo_height(), 40)
+        if self.chart_series is None or len(self.chart_series.points) < 2:
+            canvas.create_text(width / 2, height / 2, text=self.chart_message,
+                               fill='#617286', font=('Segoe UI', 9), width=width - 16)
+            return
+        points = self.chart_series.points
+        end = self.chart_series.received_at
+        start = end - timedelta(hours=24)
+        values = [point.close for point in points]
+        minimum, maximum = min(values), max(values)
+        left, right, top, bottom = 9, width - 9, 9, height - 19
+        coordinates = []
+        for point in points:
+            fraction = (point.timestamp - start).total_seconds() / 86400
+            x = left + max(0, min(1, fraction)) * (right - left)
+            # Decimal-нормализация не теряет очень маленькие цены и не даёт infinity.
+            y_fraction = Decimal('0.5') if maximum == minimum else (point.close - minimum) / (maximum - minimum)
+            y = bottom - float(y_fraction) * (bottom - top)
+            coordinates.extend((x, y))
+        canvas.create_line(left, bottom, right, bottom, fill='#E5EDF2')
+        canvas.create_line(*coordinates, fill='#087F8C', width=2)
+        x, y = coordinates[-2:]
+        canvas.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill='#087F8C', outline='')
+        canvas.create_text(left, height - 8, text='24 ч назад', anchor='w', fill='#7A8B9A', font=('Segoe UI', 7))
+        canvas.create_text(right, height - 8, text='текущая цена', anchor='e', fill='#7A8B9A', font=('Segoe UI', 7))
 
     def refresh(self):
         if self.closed or self.busy:
@@ -502,6 +902,9 @@ class CryptoApp:
         self.refresh_button.configure(state='disabled')
         self._update_status()
         self._render_card()
+        self.chart_token = None
+        self._clear_chart('Обновляем котировки…')
+        self.chart_caption.set('История появится после обновления')
         Thread(
             target=fetch_in_worker, args=(self.provider, self.results), daemon=True,
         ).start()
@@ -513,18 +916,25 @@ class CryptoApp:
             self.stale = self.snapshot is not None
             self._render_card()
             self._update_status()
+            self.chart_series = None
+            self.chart_token = None
+            self.chart_message = 'История не обновлена'
+            self.chart_caption.set('Обновите данные для графика')
+            self._draw_chart()
             return
 
         self.snapshot = snapshot
+        self.snapshot_version += 1
         self.stale = False
         self.last_error = ''
-        self.source.set(f'Источник: {snapshot.source}  •  Прямые спотовые пары')
+        self.source.set(f'{snapshot.source} · прямые пары и пересчёт через USD · 12 валют')
         self.price_note.set(
-            f'Прямые спотовые пары {snapshot.source}. USD и USDT не приравниваются друг к другу.'
+            'USD и USDT — разные валюты. Расчётные цены отмечены знаком ≈ и источником пересчёта.'
         )
         received = snapshot.received_at.astimezone(MOSCOW_TIME).strftime('%d.%m.%Y %H:%M:%S')
         self.received.set(f'Данные получены: {received} МСК')
         self._render_view()
+        self._schedule_chart()
 
     def _poll(self):
         if self.closed:
@@ -535,6 +945,8 @@ class CryptoApp:
             pass
         else:
             self._show_result(snapshot, error)
+
+        self._poll_chart_results()
 
         now = time.monotonic()
         elapsed = None if self.last_request_started is None else now - self.last_request_started
@@ -547,7 +959,9 @@ class CryptoApp:
 
     def close(self):
         self.closed = True
-        for timer_id in (self.start_id, self.timer_id):
+        self.chart_token = None
+        self.chart_pending = None
+        for timer_id in (self.start_id, self.timer_id, self.chart_debounce_id):
             if timer_id is not None:
                 self.root.after_cancel(timer_id)
         self.root.destroy()
