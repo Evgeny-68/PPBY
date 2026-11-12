@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 import requests
 
 spec = importlib.util.spec_from_file_location(
-    'crypto_window_task6', Path(__file__).with_name('Задание 6.py')
+    'crypto_window_final', Path(__file__).with_name('Zadanie_final.py')
 )
 gui = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = gui
