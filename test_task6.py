@@ -274,18 +274,108 @@ class BybitClientTests(unittest.TestCase):
             BybitClient().fetch_quotes()
 
 
+class FakeVar:
+    """Минимальная StringVar без создания окна Tk."""
+    def __init__(self, value=''):
+        self.value = value
+        self.history = []
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+        self.history.append(value)
+
+
+class FakeTable:
+    """Хранит видимые строки и выбор так же, как нужная тестам часть Treeview."""
+    def __init__(self):
+        self.rows = {}
+        self.selected = ()
+        self.headings = {}
+        self.updates = []
+
+    def get_children(self, item=''):
+        return tuple(self.rows)
+
+    def exists(self, iid):
+        return iid in self.rows
+
+    def insert(self, parent, index, iid, values=(), **kwargs):
+        self.rows[iid] = tuple(values)
+        return iid
+
+    def delete(self, *items):
+        for iid in items:
+            self.rows.pop(iid, None)
+        self.selected = tuple(iid for iid in self.selected if iid in self.rows)
+
+    def item(self, iid, option=None, **kwargs):
+        if 'values' in kwargs:
+            self.rows[iid] = tuple(kwargs['values'])
+            self.updates.append((iid, self.rows[iid]))
+        if option == 'values':
+            return self.rows[iid]
+        return {'values': self.rows[iid]}
+
+    def selection(self):
+        return self.selected
+
+    def selection_set(self, items):
+        self.selected = (items,) if isinstance(items, str) else tuple(items)
+
+    def selection_remove(self, *items):
+        self.selected = tuple(iid for iid in self.selected if iid not in items)
+
+    def focus(self, item=None):
+        if item is not None:
+            self.focused = item
+        return getattr(self, 'focused', '')
+
+    def see(self, item):
+        self.visible_item = item
+
+    def heading(self, column, **kwargs):
+        self.headings[column] = kwargs
+
+
 class WorkerAndWindowTests(unittest.TestCase):
     def window(self, snapshot=None):
         window = object.__new__(gui.CryptoApp)
-        window.snapshot, window.busy = snapshot, True
-        window.status, window.received = Mock(), Mock()
-        window.tables = {'USD': Mock(), 'USDT': Mock()}
-        window.source, window.price_note = Mock(), Mock()
+        window.snapshot, window.busy = snapshot, False
+        window.closed, window.stale, window.last_error = False, False, ''
+        window.status = FakeVar()
+        window.received = FakeVar('Данные ещё не получены')
+        window.source, window.price_note = FakeVar(), FakeVar()
+        window.coin_selection = FakeVar('BTC — Bitcoin')
+        window.currency_selection = FakeVar('USD — доллар США')
+        window.pair_title, window.price_text = FakeVar(), FakeVar()
+        window.low_text, window.high_text = FakeVar(), FakeVar()
+        window.selection_hint, window.card_state = FakeVar(), FakeVar()
+        window.market_title = FakeVar()
+        window.displayed_currency = None
+        window.state_label, window.status_label = Mock(), Mock()
+        window.table = FakeTable()
+        window.provider, window.refresh, window.refresh_button = Mock(), Mock(), Mock()
+        window.root, window.results = Mock(), Queue()
+        window.auto_refresh = FakeVar(False)
+        window.last_request_started = None
         return window
+
+    def snapshot(self, payload=None, received_at=None):
+        return Snapshot(
+            parse_quotes(ticker_payload() if payload is None else payload),
+            received_at or datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+    def assert_no_network_on_selection(self, window):
+        window.refresh.assert_not_called()
+        window.provider.fetch_quotes.assert_not_called()
 
     def test_worker_delivers_success_to_queue(self):
         provider, results = Mock(), Queue()
-        snapshot = Snapshot(parse_quotes(ticker_payload()), datetime.now(timezone.utc))
+        snapshot = self.snapshot()
         provider.fetch_quotes.return_value = snapshot
         gui.fetch_in_worker(provider, results)
         self.assertEqual(results.get_nowait(), (snapshot, None))
@@ -305,75 +395,186 @@ class WorkerAndWindowTests(unittest.TestCase):
         self.assertIn('Не удалось обработать', error)
         self.assertNotIn('internal detail', error)
 
-    def test_failed_refresh_keeps_both_tables_and_timestamp(self):
-        previous = Snapshot(parse_quotes(ticker_payload()), datetime.now(timezone.utc))
-        window = self.window(previous)
+    def test_success_preserves_selection_and_updates_card_table_and_receipt(self):
+        window = self.window()
+        window.coin_selection.set('ETH — Ethereum')
+        window.currency_selection.set('USDT — Tether')
+        snapshot = Snapshot(self.snapshot().quotes, self.snapshot().received_at, source='Test Exchange')
+        window._show_result(snapshot, None)
+        self.assertEqual(window._selected_codes(), ('ETH', 'USDT'))
+        self.assertEqual(len(window.table.rows), 8)
+        self.assertEqual(set(window.table.rows), {
+            quote.row_id for quote in snapshot.quotes if quote.currency == 'USDT'
+        })
+        self.assertEqual(window.table.selection(), ('ETH:USDT',))
+        self.assertIn('3 001.25', window.price_text.get())
+        self.assertIs(window.snapshot, snapshot)
+        self.assertEqual(window.received.get(), 'Данные получены: 01.01.2026 03:00:00 МСК')
+        self.assertIn('Test Exchange', window.source.get())
+        self.assertIn('Test Exchange', window.price_note.get())
+        self.assertFalse(window.stale)
+        self.assertEqual(window.last_error, '')
+
+    def test_currency_selection_uses_saved_direct_prices_without_request(self):
+        window = self.window()
+        window._show_result(self.snapshot(), None)
+        received_history = list(window.received.history)
+        self.assertIn('60 000.10', window.price_text.get())
+        window.currency_selection.set('USDT — Tether')
+        window._on_currency_selected()
+        self.assertIn('60 010.20', window.price_text.get())
+        self.assertEqual(window._selected_codes(), ('BTC', 'USDT'))
+        self.assertTrue(all(iid.endswith(':USDT') for iid in window.table.rows))
+        self.assertNotIn('BTC:USD', window.table.rows)
+        self.assertEqual(window.received.history, received_history)
+        self.assert_no_network_on_selection(window)
+
+    def test_coin_selection_updates_card_and_table_selection_without_request(self):
+        window = self.window()
+        window._show_result(self.snapshot(), None)
+        received_history = list(window.received.history)
+        window.coin_selection.set('ETH — Ethereum')
+        window._on_coin_selected()
+        self.assertEqual(window._selected_codes(), ('ETH', 'USD'))
+        self.assertEqual(window.table.selection(), ('ETH:USD',))
+        self.assertIn('3 000.25', window.price_text.get())
+        self.assertEqual(window.received.history, received_history)
+        self.assert_no_network_on_selection(window)
+
+    def test_table_selection_updates_coin_combobox_and_card_without_request(self):
+        window = self.window()
+        window._show_result(self.snapshot(), None)
+        received_history = list(window.received.history)
+        window.table.selection_set('ETH:USD')
+        window._on_table_selected()
+        self.assertEqual(window.coin_selection.get(), 'ETH — Ethereum')
+        self.assertIn('3 000.25', window.price_text.get())
+        self.assertEqual(window._selected_codes(), ('ETH', 'USD'))
+        self.assertEqual(window.received.history, received_history)
+        self.assert_no_network_on_selection(window)
+
+    def test_table_event_for_previous_currency_does_not_change_current_choice(self):
+        window = self.window()
+        window._show_result(self.snapshot(), None)
+        window.table.selection_set('ETH:USDT')
+        window._on_table_selected()
+        self.assertEqual(window._selected_codes(), ('BTC', 'USD'))
+        self.assertIn('60 000.10', window.price_text.get())
+        self.assert_no_network_on_selection(window)
+
+    def test_selection_before_first_load_clears_any_old_card_price(self):
+        window = self.window()
+        window.price_text.set('60 000.10')
+        window.coin_selection.set('SOL — Solana')
+        window._on_coin_selected()
+        window.currency_selection.set('USDT — Tether')
+        window._on_currency_selected()
+        self.assertEqual(window._selected_codes(), ('SOL', 'USDT'))
+        self.assertNotIn('60 000.10', window.price_text.get())
+        self.assertIn('SOL', window.pair_title.get())
+        self.assertIn('USDT', window.pair_title.get())
+        self.assertTrue(all('140.05' not in values for values in window.table.rows.values()))
+        self.assertEqual(window.received.history, [])
+        self.assert_no_network_on_selection(window)
+
+    def test_missing_pair_offers_alternative_without_substituting_its_price(self):
+        window = self.window()
+        window._show_result(self.snapshot(), None)
+        window.coin_selection.set('GRAM — Gram (Toncoin)')
+        window._on_coin_selected()
+        self.assertEqual(window._selected_codes(), ('GRAM', 'USD'))
+        self.assertNotIn('0.00234878', window.price_text.get())
+        self.assertNotIn('0.00234878', window.table.rows['GRAM:USD'])
+        self.assertIn('USDT', window.selection_hint.get())
+        self.assert_no_network_on_selection(window)
+
+    def test_identity_pair_shows_quote_currency_without_fake_one(self):
+        window = self.window()
+        window._show_result(self.snapshot(), None)
+        window.coin_selection.set('USDT — Tether')
+        window.currency_selection.set('USDT — Tether')
+        window._on_currency_selected()
+        self.assertEqual(window._selected_codes(), ('USDT', 'USDT'))
+        self.assertNotIn(window.price_text.get(), ('1', '1.00', '1 USDT', '1.00 USDT'))
+        self.assertIn('котиров', (window.selection_hint.get() + window.card_state.get()).lower())
+        self.assert_no_network_on_selection(window)
+
+    def test_failed_refresh_preserves_visible_values_and_receipt(self):
+        window = self.window()
+        previous = self.snapshot()
+        window._show_result(previous, None)
+        rows = copy.deepcopy(window.table.rows)
+        received_history = list(window.received.history)
+        window.busy = True
         window._show_result(None, 'Нет сети')
         self.assertIs(window.snapshot, previous)
         self.assertFalse(window.busy)
-        self.assertIn('устаревшие данные', window.status.set.call_args.args[0])
-        for table in window.tables.values():
-            table.item.assert_not_called()
-        window.received.set.assert_not_called()
+        self.assertTrue(window.stale)
+        self.assertEqual(window.table.rows, rows)
+        self.assertEqual(window.received.history, received_history)
+        self.assertIn('устар', window.status.get().lower())
+        self.assertIn('устар', window.card_state.get().lower())
+        self.assertIn('Нет сети', window.status.get())
 
-    def test_no_previous_values_are_fabricated_on_failure(self):
+    def test_stale_state_survives_selection_and_clears_only_on_success(self):
         window = self.window()
+        window._show_result(self.snapshot(), None)
+        received_history = list(window.received.history)
         window._show_result(None, 'Нет сети')
-        self.assertIn('Данные не получены', window.status.set.call_args.args[0])
-        for table in window.tables.values():
-            table.item.assert_not_called()
-        self.assertIsNone(window.snapshot)
+        window.coin_selection.set('ETH — Ethereum')
+        window._on_coin_selected()
+        window.currency_selection.set('USDT — Tether')
+        window._on_currency_selected()
+        self.assertTrue(window.stale)
+        self.assertIn('устар', window.card_state.get().lower())
+        self.assertIn('устар', window.status.get().lower())
+        self.assertIn('3 001.25', window.price_text.get())
+        self.assertEqual(window.received.history, received_history)
+        window._show_result(self.snapshot(received_at=datetime(2026, 1, 1, 1, tzinfo=timezone.utc)), None)
+        self.assertFalse(window.stale)
+        self.assertEqual(window.last_error, '')
+        self.assertNotIn('устар', window.card_state.get().lower())
+        self.assertEqual(window._selected_codes(), ('ETH', 'USDT'))
+        self.assert_no_network_on_selection(window)
 
-    def test_success_updates_each_table_and_receipt_time(self):
+    def test_initial_failure_does_not_fabricate_prices(self):
         window = self.window()
-        snapshot = Snapshot(
-            parse_quotes(ticker_payload()), datetime(2026, 1, 1, tzinfo=timezone.utc),
-            source='Test Exchange',
-        )
-        window._show_result(snapshot, None)
-        for currency, table in window.tables.items():
-            self.assertEqual(table.item.call_count, 8)
-            self.assertEqual(
-                {call.args[0] for call in table.item.call_args_list},
-                {quote.row_id for quote in snapshot.quotes if quote.currency == currency},
-            )
-        self.assertIs(window.snapshot, snapshot)
-        window.received.set.assert_called_once_with('Данные получены: 01.01.2026 03:00:00 МСК')
-        self.assertIn('Test Exchange', window.source.set.call_args.args[0])
-        self.assertIn('Test Exchange', window.price_note.set.call_args.args[0])
-        self.assertIn('10', window.status.set.call_args.args[0])
+        window._render_view()
+        rows = copy.deepcopy(window.table.rows)
+        window._show_result(None, 'Нет сети')
+        self.assertIsNone(window.snapshot)
+        self.assertEqual(window.table.rows, rows)
+        self.assertIn('Данные не получены', window.status.get())
+        self.assertEqual(window.received.history, [])
+        self.assertNotIn('60 000.10', window.price_text.get())
 
-    def test_missing_pairs_clear_old_prices_in_both_tables_after_successful_refresh(self):
-        previous = Snapshot(parse_quotes(ticker_payload()), datetime.now(timezone.utc))
-        window = self.window(previous)
+    def test_missing_pairs_clear_previous_numbers_after_refresh_and_currency_switch(self):
+        window = self.window()
+        window._show_result(self.snapshot(), None)
         payload = ticker_payload()
         payload['result']['list'] = [
-            item for item in payload['result']['list']
-            if item['symbol'] not in ('BTCUSD', 'ETHUSDT')
+            item for item in payload['result']['list'] if item['symbol'] not in ('BTCUSD', 'ETHUSDT')
         ]
-        new_snapshot = Snapshot(parse_quotes(payload), datetime.now(timezone.utc))
-        window._show_result(new_snapshot, None)
-        for currency, row_id, old_price in (
-            ('USD', 'BTC:USD', '60 000.10'),
-            ('USDT', 'ETH:USDT', '3 001.25'),
-        ):
-            with self.subTest(currency=currency):
-                row_call = next(
-                    call for call in window.tables[currency].item.call_args_list
-                    if call.args[0] == row_id
-                )
-                displayed_values = row_call.kwargs['values']
-                self.assertIn('Нет данных по паре', displayed_values)
-                self.assertIn('—', displayed_values)
-                self.assertNotIn(old_price, displayed_values)
-        self.assertIs(window.snapshot, new_snapshot)
+        snapshot = self.snapshot(payload)
+        window._show_result(snapshot, None)
+        self.assertNotIn('60 000.10', window.table.rows['BTC:USD'])
+        self.assertNotIn('60 000.10', window.price_text.get())
+        self.assertIn('Нет данных', ' '.join(window.table.rows['BTC:USD']))
+        window.coin_selection.set('ETH — Ethereum')
+        window.currency_selection.set('USDT — Tether')
+        window._on_currency_selected()
+        self.assertNotIn('3 001.25', window.table.rows['ETH:USDT'])
+        self.assertNotIn('3 001.25', window.price_text.get())
+        self.assertIn('Нет данных', ' '.join(window.table.rows['ETH:USDT']))
+        self.assertIs(window.snapshot, snapshot)
+        self.assert_no_network_on_selection(window)
 
     def test_busy_and_rate_limit_prevent_duplicate_requests(self):
-        window = object.__new__(gui.CryptoApp)
-        window.closed, window.busy = False, True
+        window = self.window()
+        # В этом тесте вызываем настоящий refresh, не заглушку выбора валют.
+        del window.refresh
+        window.busy = True
         window.last_request_started = 100.0
-        window.provider, window.results = Mock(), Queue()
-        window.refresh_button, window.status = Mock(), Mock()
         with patch.object(gui.time, 'monotonic', return_value=104.9), patch.object(gui, 'Thread') as thread:
             window.refresh()
             window.busy = False
@@ -403,21 +604,17 @@ class WorkerAndWindowTests(unittest.TestCase):
         )
         for enabled, now, busy, expected_calls in scenarios:
             with self.subTest(enabled=enabled, now=now, busy=busy):
-                window = object.__new__(gui.CryptoApp)
-                window.closed, window.busy = False, busy
-                window.results, window.last_request_started = Queue(), 100.0
-                window.root, window.refresh_button = Mock(), Mock()
-                window.auto_refresh, window.refresh = Mock(), Mock()
-                window.auto_refresh.get.return_value = enabled
+                window = self.window()
+                window.busy, window.last_request_started = busy, 100.0
+                window.auto_refresh.set(enabled)
                 with patch.object(gui.time, 'monotonic', return_value=now):
                     window._poll()
                 self.assertEqual(window.refresh.call_count, expected_calls)
                 window.root.after.assert_called_once_with(100, window._poll)
 
     def test_close_cancels_timers_and_prevents_further_work(self):
-        window = object.__new__(gui.CryptoApp)
-        window.root = Mock()
-        window.closed = False
+        window = self.window()
+        del window.refresh
         window.start_id, window.timer_id = 'startup_timer', 'poll_timer'
         window.close()
         self.assertTrue(window.closed)
